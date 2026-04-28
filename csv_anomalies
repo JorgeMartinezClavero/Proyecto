@@ -1,0 +1,164 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import MinMaxScaler
+from datetime import datetime
+
+# -----------------------------
+# ⚙️ CONFIG
+# -----------------------------
+N_SUBCICLOS = 33
+TARGET_LEN = 50 
+THRESHOLD_FACTOR = 1.5
+
+# -----------------------------
+# 🧠 MODELO
+# -----------------------------
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim):
+        super(Autoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 64), nn.ReLU(),
+            nn.Linear(64, 32), nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(32, 64), nn.ReLU(),
+            nn.Linear(64, input_dim)
+        )
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+def normalize_cycle(cycle, target_len=TARGET_LEN):
+    if len(cycle) < 2: return np.zeros(target_len)
+    return np.interp(np.linspace(0, len(cycle)-1, target_len), np.arange(len(cycle)), cycle)
+
+# -----------------------------
+# 🛠️ PROCESAMIENTO RÁPIDO (Flexible con columnas extra)
+# -----------------------------
+def process_csv_fast(df):
+    """
+    Extrae los ciclos basándose en Repetition y Subcycle.
+    No importa si el CSV tiene 3 o 100 columnas.
+    """
+    cycles = []
+    metadata = []
+    
+    # Agrupamos solo por las necesarias
+    grouped = df.groupby(['Repetition', 'Subcycle'])
+    
+    for (rep, sub), group in grouped:
+        if len(group) >= 10:
+            # Tomamos solo la columna Measurement para el modelo
+            normalized = normalize_cycle(group['Measurement'].values)
+            cycles.append(normalized)
+            metadata.append({'Subcycle': int(sub), 'Repetition': int(rep)})
+            
+    return np.array(cycles), metadata
+
+@st.cache_resource
+def train_and_analyze(df):
+    X_raw, meta = process_csv_fast(df)
+    if len(X_raw) == 0: return pd.DataFrame()
+
+    sub_ids = np.array([m['Subcycle'] for m in meta])
+    sub_onehot = np.eye(N_SUBCICLOS)[sub_ids - 1].astype(np.float32)
+    X_full = np.concatenate([X_raw.astype(np.float32), sub_onehot], axis=1)
+    
+    scaler = MinMaxScaler()
+    X_scaled = scaler.fit_transform(X_full)
+    X_tensor = torch.from_numpy(X_scaled).float()
+     
+    model = Autoencoder(X_scaled.shape[1])
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    criterion = nn.MSELoss()
+    
+    model.train()
+    for _ in range(50):
+        optimizer.zero_grad()
+        loss = criterion(model(X_tensor), X_tensor)
+        loss.backward()
+        optimizer.step()
+        
+    model.eval()
+    with torch.no_grad():
+        recon = model(X_tensor)
+        errors = torch.mean((X_tensor - recon)**2, dim=1).numpy()
+    
+    thresholds = {}
+    for s in range(1, N_SUBCICLOS + 1):
+        mask = (sub_ids == s)
+        thresholds[s] = np.percentile(errors[mask], 95) if any(mask) else np.mean(errors)
+
+    results = []
+    for i, m in enumerate(meta):
+        umbral = thresholds[m['Subcycle']] * THRESHOLD_FACTOR
+        is_anomaly = errors[i] > umbral
+        results.append({
+            "Repetition": m['Repetition'],
+            "Subcycle": m['Subcycle'],
+            "Reconstruction_Error": round(float(errors[i]), 5),
+            "Threshold": round(float(umbral), 5),
+            "Status": "🚨 Anomaly" if is_anomaly else "✅ OK"
+        })
+        
+    return pd.DataFrame(results)
+
+# -----------------------------
+# 🚀 INTERFAZ STREAMLIT
+# -----------------------------
+st.set_page_config(page_title="Multi-column CSV Analyzer", layout="wide")
+st.title("🛡️ Fast Anomaly Detector")
+
+st.markdown("""
+### Instrucciones
+Puedes subir un CSV con cualquier número de columnas. El sistema detectará automáticamente:
+1. **Measurement**: Los valores del sensor.
+2. **Subcycle**: El identificador del paso (1-33).
+3. **Repetition**: El número de ciclo de la máquina.
+""")
+
+uploaded_file = st.file_uploader("Upload your data.csv", type="csv")
+
+if uploaded_file:
+    try:
+        # Cargamos el CSV completo
+        df_input = pd.read_csv(uploaded_file, sep=';')
+        
+        # Validar solo que existan las mínimas necesarias
+        required = {'Measurement', 'Subcycle', 'Repetition'}
+        missing = required - set(df_input.columns)
+        
+        if missing:
+            st.error(f"Faltan columnas obligatorias: {missing}. El CSV tiene: {list(df_input.columns)}")
+            st.stop()
+
+        # Mostrar las columnas detectadas como extra (solo informativo)
+        extra_cols = set(df_input.columns) - required
+        if extra_cols:
+            st.write(f"💡 **Columnas extra detectadas e ignoradas:** `{', '.join(extra_cols)}`")
+
+        with st.spinner('Analyzing data...'):
+            results_df = train_and_analyze(df_input)
+        
+        if not results_df.empty:
+            # Métricas
+            anomalies = results_df[results_df['Status'] == "🚨 Anomaly"]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Cycles", len(results_df))
+            c2.metric("Anomalies", len(anomalies))
+            c3.metric("Health Rate", f"{((len(results_df)-len(anomalies))/len(results_df)*100):.1f}%")
+            
+            st.divider()
+            
+            # Tabla de resultados
+            st.subheader("Results Table")
+            st.dataframe(results_df, use_container_width=True)
+            
+            st.download_button("📥 Export Results", results_df.to_csv(index=False), "results.csv")
+            
+    except Exception as e:
+        st.error(f"Error procesando el archivo: {e}")
+else:
+    st.info("Waiting for CSV...")
