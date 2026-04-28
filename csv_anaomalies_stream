@@ -1,0 +1,211 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import MinMaxScaler
+from streamlit_autorefresh import st_autorefresh
+from datetime import datetime
+
+# -----------------------------
+# ⚙️ CONFIG
+# -----------------------------
+N_SubcycleS = 33
+TARGET_LEN = 50 
+THRESHOLD_FACTOR = 1.5
+
+# -----------------------------
+# 📂 CARGA DE DATOS
+# -----------------------------
+@st.cache_data
+def load_csv_data():
+    # Asegúrate de que el CSV tenga las columnas: 'Measurement', 'Subcycle', 'Repetition'
+    df = pd.read_csv('data.csv', sep=';')
+    return df
+
+# -----------------------------
+# 🧩 UTILIDADES
+# -----------------------------
+def normalize_cycle(cycle, target_len=TARGET_LEN):
+    if len(cycle) < 2:
+        return np.zeros(target_len)
+    return np.interp(
+        np.linspace(0, len(cycle) - 1, target_len),
+        np.arange(len(cycle)),
+        cycle
+    )
+
+# -----------------------------
+# 🧠 MODELO EN PYTORCH
+# -----------------------------
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim):
+        super(Autoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, input_dim)
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+# -----------------------------
+# 🔄 STREAM DESDE CSV (Modificado)
+# -----------------------------
+def data_stream_csv(df):
+    """Itera sobre las filas del DataFrame simulando un flujo."""
+    for _, row in df.iterrows():
+        yield row['Measurement'], int(row['Subcycle']), int(row['Repetition'])
+
+# -----------------------------
+# 🏋️ ENTRENAMIENTO (Basado en CSV)
+# -----------------------------
+@st.cache_resource
+def train_model_torch(df):
+    X_list, sub_ids = [], []
+    buffer_train = {}
+    
+    # Procesamos el CSV para agrupar por ciclos y normalizar
+    for _, row in df.iterrows():
+        Measurement, sub, rep = row['Measurement'], int(row['Subcycle']), int(row['Repetition'])
+        key = (sub, rep)
+        buffer_train.setdefault(key, []).append(Measurement)
+        
+        # Cuando el ciclo tiene suficientes datos, lo normalizamos
+        if len(buffer_train[key]) >= 50:
+            X_list.append(normalize_cycle(buffer_train[key]))
+            sub_ids.append(sub)
+            buffer_train[key] = [] # Limpiar para no repetir el mismo ciclo
+
+    if not X_list:
+        raise ValueError("No se pudieron extraer ciclos de 50 puntos del CSV.")
+
+    X = np.array(X_list, dtype=np.float32)
+    sub_ids_np = np.array(sub_ids)
+    sub_onehot = np.eye(N_SubcycleS)[sub_ids_np - 1].astype(np.float32)
+    X_full = np.concatenate([X, sub_onehot], axis=1)
+
+    scaler = MinMaxScaler()
+    X_scaled = scaler.fit_transform(X_full)
+    
+    input_dim = X_scaled.shape[1]
+    model = Autoencoder(input_dim)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    criterion = nn.MSELoss()
+    
+    X_tensor = torch.from_numpy(X_scaled).float()
+    
+    # Entrenamiento
+    model.train()
+    for _ in range(100):
+        optimizer.zero_grad()
+        output = model(X_tensor)
+        loss = criterion(output, X_tensor)
+        loss.backward()
+        optimizer.step()
+
+    # Cálculo de umbrales
+    model.eval()
+    thresholds = {}
+    with torch.no_grad():
+        recon = model(X_tensor)
+        errors = torch.mean((X_tensor - recon)**2, dim=1).numpy()
+    
+    global_mean_error = np.mean(errors) if len(errors) > 0 else 0.1
+    
+    for s in range(1, N_SubcycleS + 1):
+        mask = (sub_ids_np == s)
+        if np.any(mask):
+            thresholds[s] = np.percentile(errors[mask], 95)
+        else:
+            thresholds[s] = global_mean_error
+
+    return model, scaler, thresholds
+
+# -----------------------------
+# 🚀 INICIALIZACIÓN
+# -----------------------------
+st.set_page_config(page_title="Monitor de Anomalías CSV", layout="wide")
+
+try:
+    df_data = load_csv_data()
+    model, scaler, thresholds = train_model_torch(df_data)
+    model.eval()
+except Exception as e:
+    st.error(f"Error cargando datos o entrenando: {e}")
+    st.stop()
+
+# -----------------------------
+# 🚀 STREAMLIT UI
+# -----------------------------
+st.title("🛡️ Monitor de Subcycles (Datos desde CSV)")
+
+st_autorefresh(interval=500, key="refresh") # Un poco más rápido para CSV
+
+if "buffer" not in st.session_state: st.session_state.buffer = {}
+if "stream" not in st.session_state: st.session_state.stream = data_stream_csv(df_data)
+if "history" not in st.session_state: st.session_state.history = []
+
+# Captura del dato actual del CSV
+try:
+    Measurement, sub, rep = next(st.session_state.stream)
+    key = (sub, rep)
+    st.session_state.buffer.setdefault(key, []).append(Measurement)
+
+    # Métricas
+    col_val, col_sub, col_rep = st.columns(3)
+    col_val.metric("Measurement Sensor (CSV)", f"{Measurement:.2f}")
+    col_sub.metric("Subcycle", sub)
+    col_rep.metric("Repetición", rep)
+
+    # Detección
+    if len(st.session_state.buffer[key]) >= 50:
+        serie = normalize_cycle(st.session_state.buffer[key])
+        st.session_state.buffer.pop(key) 
+        
+        sub_onehot = np.eye(N_SubcycleS)[sub - 1]
+        X_input = np.concatenate([serie, sub_onehot]).reshape(1, -1).astype(np.float32)
+        X_scaled = scaler.transform(X_input)
+        
+        with torch.no_grad():
+            input_t = torch.from_numpy(X_scaled)
+            recon = model(input_t)
+            error_reconstruccion = torch.mean((input_t - recon)**2).item()
+        
+        umbral_referencia = thresholds.get(sub, 0.1) * THRESHOLD_FACTOR
+        
+        if error_reconstruccion > umbral_referencia:
+            st.error(f"🚨 Anomalía detectada en Subcycle {sub} (Rep {rep})")
+            st.session_state.history.insert(0, {
+                "Hora": datetime.now().strftime("%H:%M:%S"),
+                "Subcycle": sub,
+                "Repetición": rep,
+                "Error": round(error_reconstruccion, 5),
+                "Umbral": round(umbral_referencia, 5),
+                "Estado": "🚨 Crítico"
+            })
+        else:
+            st.success(f"✅ Subcycle {sub} OK")
+
+except StopIteration:
+    st.warning("Fin de los datos del archivo CSV.")
+
+# -----------------------------
+# 📜 HISTORIAL
+# -----------------------------
+st.write("---")
+st.subheader("📋 Historial de Anomalías")
+if st.session_state.history:
+    if st.button("🗑️ Limpiar Historial"):
+        st.session_state.history = []
+        st.rerun()
+    st.table(st.session_state.history[:15])
+else:
+    st.info("Analizando CSV... El sistema está funcionando correctamente.")
