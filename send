@@ -1,0 +1,7 @@
+SELECT Estado, Resultado,
+       AVG(DATEDIFF(hour, FechaInicio, FechaFin)) AS horas_media,
+       COUNT(*) AS n
+FROM Ensayos
+WHERE Area = 'FIA'
+GROUP BY Estado, Resultado
+ORDER BY Estado, Resultado;
