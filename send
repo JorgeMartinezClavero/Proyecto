@@ -1,118 +1,44 @@
-"""
-Comprueba, para cada test etiquetado en Ensayos, si existen datos de
-Measurement_all (en la BBDD actual y/o en la replica historica) dentro de
-la ventana temprana del test. NO agrega variables todavia: solo mira
-existencia y rango de fechas, para decidir rapido cuantos tests son
-aprovechables antes de invertir tiempo en el pipeline completo.
+-- Ejecutar en el servidor donde vive QIT_DB.dbo.Ensayos
+-- Exportar el resultado a CSV (botón derecho en SSMS -> "Save Results As" o Result to File)
+-- Este CSV es el input de 02_build_dataset.py
 
-Requiere:
-    pip install pandas pyodbc sqlalchemy tqdm
-
-Uso:
-    python 00_check_coverage.py
-Salida:
-    coverage_report.csv  -> una fila por test, indicando si hay datos
-                            en 'actual', en 'replica', o en ninguna.
-"""
-
-import pandas as pd
-from sqlalchemy import create_engine
-from tqdm import tqdm
-
-ENSAYOS_CSV = "ensayos_fia_labels.csv"   # ya filtrado: Estado IN (4,5), duracion>0, sin NOK_EST
-EARLY_FRACTION = 0.15
-
-# Ajusta ambas conexiones a tu entorno real
-CONN_ACTUAL = (
-    "mssql+pyodbc://@TU_SERVIDOR_ACTUAL/QIT_DATAMINING_20"
-    "?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
-)
-CONN_REPLICA = (
-    "mssql+pyodbc://@TU_SERVIDOR_REPLICA/QIT_DATAMINING_20_replica"
-    "?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
-)
-
-# Query ligera: solo existencia/extension, sin agregar por variable
-CHECK_QUERY = """
 SELECT
-    MIN(seq.TimeStamp) AS first_ts,
-    MAX(seq.TimeStamp) AS last_ts,
-    COUNT(DISTINCT SbRep.Repetition) AS n_repeticiones,
-    COUNT(*) AS n_filas
-FROM Measurement_all AS m
-JOIN Sequence AS seq ON m.ID_Sequence = seq.ID_Sequence
-JOIN SbRep    ON seq.ID_SbRep = SbRep.ID_SbRep
-JOIN TIP      ON SbRep.ID_TIP = TIP.ID_TIP
-JOIN TPS      ON TPS.ID_TPS = TIP.ID_TPS
-JOIN DUT      ON DUT.ID_DUT = TPS.ID_DUT
-WHERE DUT.SNR = ?
-  AND DUT.FD = ?
-  AND DUT.VIB = ?
-  AND TIP.TestName = ?
-  AND seq.TimeStamp >= ?
-  AND seq.TimeStamp < ?
-"""
+    ID,
+    Area,
+    TipoFIA,
+    Ubicacion,
+    VIB,
+    FD,
+    SNR,
+    Ciclo            AS TestName,
+    FechaInicio,
+    FechaFin,
+    FechaFinEstimada,
+    Subciclo          AS UltimoSubciclo,   -- punto donde se detuvo el test (útil como feature)
+    Repeticion        AS UltimaRepeticion, -- idem
+    Estado,
+    Resultado,
+    SerieControlada,
+    PruebaEspecifica
+FROM QIT_DB.dbo.Ensayos
+WHERE Area = 'FIA'
+  AND Resultado IS NOT NULL
+  AND (Eliminado IS NULL OR Eliminado = 0)
+  -- Solo tests con resultado ya determinado y fecha de fin real y coherente.
+  -- Excluye Ejecucion/Esperando.../Pausado, donde FechaFin suele ser un valor
+  -- por defecto y el Resultado no es fiable todavia.
+  AND Estado IN (4, 5)                                  -- Pendiente de Analisis, Finalizado
+  AND FechaFin IS NOT NULL
+  AND DATEDIFF(hour, FechaInicio, FechaFin) > 0
+  -- Excluimos defectos puramente esteticos: no son explicables por las
+  -- variables electricas/termicas que monitorizamos.
+  AND Resultado <> 'NOK_EST'
+ORDER BY FechaInicio;
 
-
-def check_one(engine, row):
-    fecha_inicio = pd.to_datetime(row["FechaInicio"])
-    fecha_fin = pd.to_datetime(row["FechaFin"])
-    cutoff = fecha_inicio + (fecha_fin - fecha_inicio) * EARLY_FRACTION
-
-    params = [row["SNR"], row["FD"], row["VIB"], row["TestName"], fecha_inicio, cutoff]
-    try:
-        res = pd.read_sql(CHECK_QUERY, engine, params=params).iloc[0]
-    except Exception as e:
-        return {"n_filas": 0, "n_repeticiones": 0, "first_ts": None, "last_ts": None, "error": str(e)}
-
-    return {
-        "n_filas": res["n_filas"] or 0,
-        "n_repeticiones": res["n_repeticiones"] or 0,
-        "first_ts": res["first_ts"],
-        "last_ts": res["last_ts"],
-        "error": None,
-    }
-
-
-def main():
-    ensayos = pd.read_csv(ENSAYOS_CSV)
-    print(f"Tests a comprobar: {len(ensayos)}")
-
-    engine_actual = create_engine(CONN_ACTUAL)
-    engine_replica = create_engine(CONN_REPLICA)
-
-    rows = []
-    for _, row in tqdm(ensayos.iterrows(), total=len(ensayos)):
-        res_actual = check_one(engine_actual, row)
-        res_replica = check_one(engine_replica, row)
-
-        origen = None
-        if res_actual["n_filas"] > 0:
-            origen = "actual"
-        elif res_replica["n_filas"] > 0:
-            origen = "replica"
-        else:
-            origen = "sin_datos"
-
-        rows.append({
-            "SNR": row["SNR"], "FD": row["FD"], "VIB": row["VIB"],
-            "TestName": row["TestName"], "Resultado": row["Resultado"],
-            "FechaInicio": row["FechaInicio"],
-            "n_filas_actual": res_actual["n_filas"],
-            "n_filas_replica": res_replica["n_filas"],
-            "n_reps_actual": res_actual["n_repeticiones"],
-            "n_reps_replica": res_replica["n_repeticiones"],
-            "origen": origen,
-        })
-
-    cov = pd.DataFrame(rows)
-    cov.to_csv("coverage_report.csv", index=False)
-
-    print("\n===== RESUMEN DE COBERTURA =====")
-    print(cov["origen"].value_counts())
-    print("\nPor resultado y origen:")
-    print(cov.groupby(["Resultado", "origen"]).size())
-
-
-if __name__ == "__main__":
-    main()
+-- Guarda el resultado como: ensayos_fia_labels.csv
+-- Comprueba antes de exportar (rápido, para verificar que el filtro es el esperado):
+--
+-- SELECT Resultado, COUNT(*) AS n
+-- FROM QIT_DB.dbo.Ensayos
+-- WHERE Area = 'FIA' AND Resultado IS NOT NULL AND (Eliminado IS NULL OR Eliminado = 0)
+-- GROUP BY Resultado;
