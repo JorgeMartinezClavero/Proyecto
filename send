@@ -1,44 +1,38 @@
--- Ejecutar en el servidor donde vive QIT_DB.dbo.Ensayos
--- Exportar el resultado a CSV (botón derecho en SSMS -> "Save Results As" o Result to File)
--- Este CSV es el input de 02_build_dataset.py
+-- Comprobacion rapida: proporcion OK / NOK_FUNC / NOK_EST / NOK_FUNC_EST
+-- en IPR, restringido a tests cuya etapa temprana puede reconstruirse
+-- (arrancaron a partir de cuando la BBDD actual empieza a grabar bien).
 
 SELECT
-    ID,
-    Area,
-    TipoFIA,
-    Ubicacion,
-    VIB,
-    FD,
-    SNR,
-    Ciclo            AS TestName,
-    FechaInicio,
-    FechaFin,
-    FechaFinEstimada,
-    Subciclo          AS UltimoSubciclo,   -- punto donde se detuvo el test (útil como feature)
-    Repeticion        AS UltimaRepeticion, -- idem
-    Estado,
     Resultado,
-    SerieControlada,
-    PruebaEspecifica
+    COUNT(*)                                              AS n,
+    AVG(DATEDIFF(hour, FechaInicio, FechaFin))             AS horas_media,
+    MIN(FechaInicio)                                       AS primer_inicio,
+    MAX(FechaInicio)                                       AS ultimo_inicio
 FROM QIT_DB.dbo.Ensayos
-WHERE Area = 'FIA'
+WHERE Area = 'IPR'
   AND Resultado IS NOT NULL
   AND (Eliminado IS NULL OR Eliminado = 0)
-  -- Solo tests con resultado ya determinado y fecha de fin real y coherente.
-  -- Excluye Ejecucion/Esperando.../Pausado, donde FechaFin suele ser un valor
-  -- por defecto y el Resultado no es fiable todavia.
-  AND Estado IN (4, 5)                                  -- Pendiente de Analisis, Finalizado
+  AND Estado IN (4, 5)                       -- Pendiente de Analisis, Finalizado
   AND FechaFin IS NOT NULL
   AND DATEDIFF(hour, FechaInicio, FechaFin) > 0
-  -- Excluimos defectos puramente esteticos: no son explicables por las
-  -- variables electricas/termicas que monitorizamos.
-  AND Resultado <> 'NOK_EST'
-ORDER BY FechaInicio;
+  AND FechaInicio >= '2026-04-09'             -- arranque real de Measurement_all
+GROUP BY Resultado
+ORDER BY n DESC;
 
--- Guarda el resultado como: ensayos_fia_labels.csv
--- Comprueba antes de exportar (rápido, para verificar que el filtro es el esperado):
+-- Si quieres ademas ver el total y el % de NOK de un vistazo:
 --
--- SELECT Resultado, COUNT(*) AS n
+-- SELECT
+--     COUNT(*) AS total,
+--     SUM(CASE WHEN Resultado = 'OK' THEN 1 ELSE 0 END) AS n_ok,
+--     SUM(CASE WHEN Resultado IN ('NOK_FUNC','NOK_FUNC_EST') THEN 1 ELSE 0 END) AS n_nok_funcional,
+--     SUM(CASE WHEN Resultado = 'NOK_EST' THEN 1 ELSE 0 END) AS n_nok_estetico,
+--     CAST(SUM(CASE WHEN Resultado IN ('NOK_FUNC','NOK_FUNC_EST') THEN 1 ELSE 0 END) AS FLOAT)
+--         / COUNT(*) * 100 AS pct_nok_funcional
 -- FROM QIT_DB.dbo.Ensayos
--- WHERE Area = 'FIA' AND Resultado IS NOT NULL AND (Eliminado IS NULL OR Eliminado = 0)
--- GROUP BY Resultado;
+-- WHERE Area = 'IPR'
+--   AND Resultado IS NOT NULL
+--   AND (Eliminado IS NULL OR Eliminado = 0)
+--   AND Estado IN (4, 5)
+--   AND FechaFin IS NOT NULL
+--   AND DATEDIFF(hour, FechaInicio, FechaFin) > 0
+--   AND FechaInicio >= '2026-04-09';
