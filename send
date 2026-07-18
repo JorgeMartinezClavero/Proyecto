@@ -1,241 +1,391 @@
 """
-Genera las graficas principales para el capitulo de resultados, a partir
-de los ficheros ya generados por 05_train_anomaly_models.py (no hace
-falta reentrenar nada).
+Entrena y compara modelos de deteccion de anomalias sobre filas
+(test, subciclo), con tres mejoras metodologicas respecto a la primera
+version:
+
+  1) Entrenamiento SEMI-SUPERVISADO: el conjunto de entrenamiento excluye
+     TODO lo etiquetado como fallo (fiable o no), para no contaminar la
+     definicion de "comportamiento normal" con posibles fallos reales.
+
+  2) Validacion OUT-OF-SAMPLE de verdad: se separa un holdout de datos
+     normales que el modelo NUNCA ve durante el entrenamiento. Tanto el
+     chequeo cualitativo (casos NOK reales) como el cuantitativo
+     (anomalias sinteticas) se evaluan sobre ese holdout + los casos NOK,
+     nunca sobre filas ya vistas en el entrenamiento.
+
+  3) Dos modelos nuevos en la comparativa:
+       - Gaussian Mixture Model (varias "sub-poblaciones" normales a la
+         vez, razonable dado que se mezclan ~50 VIBs distintos)
+       - Autoencoder no lineal real (MLPRegressor en configuracion de
+         cuello de botella, entrenado a reconstruirse a si mismo; el
+         error de reconstruccion es el anomaly score). Sin depender de
+         Keras/PyTorch, pero ya no es una aproximacion lineal como PCA.
 
 Requiere:
-    pip install pandas matplotlib
+    pip install pandas numpy scikit-learn matplotlib
 
 Uso:
-    python 06_generar_graficas.py
-Salida (todo en la carpeta actual):
-    fig1_comparativa_sintetico.png
-    fig2_comparativa_cualitativo.png
-    fig3_distribucion_scores.png
-    fig4_caso_ejemplo.png
+    python 05_train_anomaly_models.py
 """
 
-import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
 
-SCORES_PARQUET = "subciclos_con_scores.parquet"
-CANDIDATOS_CSV = "candidatos_subciclo_alto.csv"
-SINTETICO_CSV = "comparacion_modelos_anomalias.csv"
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.svm import OneClassSVM
+from sklearn.mixture import GaussianMixture
+from sklearn.neural_network import MLPRegressor
+from sklearn.decomposition import PCA
+from sklearn.metrics import roc_auc_score, average_precision_score
 
-MODEL_ORDER = ["IsolationForest", "OneClassSVM", "LOF", "GaussianMixture",
-               "PCA (autoencoder lineal)", "Autoencoder (MLP)"]
+DATA_PATH = "subciclos_features.parquet"
+CANDIDATOS_FIABLES_CSV = "candidatos_subciclo_alto.csv"
+
+RANDOM_STATE = 42
+CONTAMINATION = 0.01      # tasa esperada de anomalias (ajusta si conoces mejor la real)
+HOLDOUT_FRACTION = 0.20   # % de datos normales reservado para validar out-of-sample
+N_SYNTHETIC = 200         # nº de anomalias sinteticas a inyectar para validar
+PERTURBATION_PCT = 0.30   # perturbacion del 30% sobre las variables de potencia
+
+GMM_N_COMPONENTS = 8      # nº de "sub-poblaciones normales" a modelar
+AUTOENCODER_HIDDEN = (24, 8, 24)  # cuello de botella: 8 << nº de variables de entrada
+
+# One-Class SVM (kernel RBF) escala mal con muchas filas. No hace falta
+# GPU (ningun modelo aqui es deep learning), pero para no tardar horas en
+# un portatil, se entrena sobre una submuestra si hay demasiadas filas.
+MAX_SAMPLES_OCSVM = 8000
+
+MODELOS = ["IsolationForest", "OneClassSVM", "LOF", "GaussianMixture",
+           "PCA (autoencoder lineal)", "Autoencoder (MLP)"]
 
 
-def cargar_datos():
-    df = pd.read_parquet(SCORES_PARQUET)
-    candidatos = pd.read_csv(
-        CANDIDATOS_CSV, dtype={"SNR": str, "VIB": str, "TestName": str, "FD": str}
-    )
+def load_data():
+    df = pd.read_parquet(DATA_PATH)
+    meta_cols = ["SNR", "TestName", "Subcycle", "Repetition", "Resultado", "Estado"]
+    feature_cols = [c for c in df.columns if c not in meta_cols]
+    cat_cols = ["VIB"]
+    num_cols = [c for c in feature_cols if c not in cat_cols]
+    return df, feature_cols, cat_cols, num_cols
+
+
+def load_casos_fiables():
+    """
+    Casos NOK_FUNC/NOK_FUNC_EST considerados fiables: UltimoSubciclo > 10
+    (proxy de "el fallo se determino tras suficiente operacion real, no
+    un aborto administrativo temprano" -- ver check_casos_fiables.py).
+    Devuelve el set de (SNR, VIB, TestName) con datos reales y ese
+    criterio cumplido, o None si no se encuentra el fichero.
+    """
+    try:
+        candidatos = pd.read_csv(
+            CANDIDATOS_FIABLES_CSV,
+            dtype={"SNR": str, "VIB": str, "TestName": str, "FD": str},
+        )
+    except FileNotFoundError:
+        print(f"\n[AVISO] No se encontro {CANDIDATOS_FIABLES_CSV} -- corre antes "
+              "check_casos_fiables.py. El chequeo cualitativo se omite.")
+        return None
     fiables = candidatos[candidatos["tiene_datos"].astype(str).str.lower() == "true"]
-    claves_fiables = set(zip(fiables["SNR"], fiables["VIB"], fiables["TestName"]))
-
-    es_nok = df["Resultado"].astype(str).str.upper().isin(["NOK_FUNC", "NOK_FUNC_EST"])
-    es_fiable = df.apply(lambda r: (r["SNR"], r["VIB"], r["TestName"]) in claves_fiables, axis=1)
-    df["_nok_fiable"] = es_nok & es_fiable
-    return df
+    return set(zip(fiables["SNR"], fiables["VIB"], fiables["TestName"]))
 
 
-def agregar_a_nivel_test(df, agg_tipo="p95"):
+def build_preprocessor(cat_cols, num_cols):
+    return ColumnTransformer([
+        ("num", SimpleImputer(strategy="median"), num_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+    ])
+
+
+def _scale_numeric_part(X_fit_t, X_score_t, n_num):
+    """Escala solo la parte numerica (las columnas categoricas ya vienen
+    en 0/1 del one-hot, no hace falta escalarlas)."""
+    scaler = StandardScaler()
+    X_fit_num = scaler.fit_transform(X_fit_t[:, :n_num])
+    X_score_num = scaler.transform(X_score_t[:, :n_num])
+    X_fit_out = np.hstack([X_fit_num, X_fit_t[:, n_num:]])
+    X_score_out = np.hstack([X_score_num, X_score_t[:, n_num:]])
+    return X_fit_out, X_score_out
+
+
+def compute_scores(name, X_fit_raw, X_score_raw, cat_cols, num_cols):
     """
-    Agrega el score de cada modelo a nivel de TEST (maximo o percentil 95
-    de sus subciclos), no subciclo a subciclo. Importante: un test NOK
-    puede haber fallado por un unico subciclo, no todos -- comparar
-    subciclo a subciclo trataria erroneamente como "anomalos" subciclos
-    de ese test que en realidad son normales. Al agregar por test, el
-    subciclo que realmente disparo el fallo domina el resultado.
+    Ajusta el modelo SOLO sobre X_fit_raw (datos normales de entrenamiento)
+    y devuelve el anomaly score (mas alto = mas anomalo) para cada fila de
+    X_score_raw. X_score_raw puede incluir filas nunca vistas en el ajuste.
     """
-    score_cols = [c for c in df.columns if c.startswith("anomaly_score__")]
-    grp = df.groupby(["SNR", "VIB", "TestName"])
+    prep = build_preprocessor(cat_cols, num_cols)
+    X_fit_t = prep.fit_transform(X_fit_raw)
+    X_score_t = prep.transform(X_score_raw)
+    X_fit_t, X_score_t = _scale_numeric_part(X_fit_t, X_score_t, len(num_cols))
 
-    if agg_tipo == "max":
-        agg = grp[score_cols].max()
-    else:
-        agg = grp[score_cols].quantile(0.95)
+    rng = np.random.RandomState(RANDOM_STATE)
 
-    es_nok_test = grp["_nok_fiable"].max().astype(bool)
-    agg = agg.join(es_nok_test).reset_index()
-    return agg
+    if name == "IsolationForest":
+        model = IsolationForest(contamination=CONTAMINATION,
+                                 random_state=RANDOM_STATE, n_jobs=-1)
+        model.fit(X_fit_t)
+        return -model.score_samples(X_score_t)
 
+    if name == "OneClassSVM":
+        X_train = X_fit_t
+        if X_train.shape[0] > MAX_SAMPLES_OCSVM:
+            idx = rng.choice(X_train.shape[0], size=MAX_SAMPLES_OCSVM, replace=False)
+            X_train = X_train[idx]
+            print(f"  [OneClassSVM] entrenando sobre submuestra de "
+                  f"{MAX_SAMPLES_OCSVM} de {X_fit_t.shape[0]} filas")
+        model = OneClassSVM(nu=CONTAMINATION, kernel="rbf", gamma="scale")
+        model.fit(X_train)
+        return -model.decision_function(X_score_t)
 
-def fig1_comparativa_sintetico():
-    """Barras: AUC-ROC y AUC-PR de la validacion con anomalias sinteticas."""
-    resultados = pd.read_csv(SINTETICO_CSV).set_index("modelo")
-    orden = [m for m in MODEL_ORDER if m in resultados.index]
-    resultados = resultados.reindex(orden)
+    if name == "LOF":
+        model = LocalOutlierFactor(n_neighbors=35, contamination=CONTAMINATION,
+                                    novelty=True)
+        model.fit(X_fit_t)
+        return -model.score_samples(X_score_t)
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-    for ax, col, titulo in zip(
-        axes, ["auc_roc_sintetico", "auc_pr_sintetico"],
-        ["AUC-ROC (anomalias sinteticas)", "AUC-PR (anomalias sinteticas)"]
-    ):
-        resultados[col].plot(kind="bar", ax=ax, color="#4C72B0", edgecolor="black")
-        ax.set_title(titulo)
-        ax.set_xlabel("")
-        ax.set_ylabel(col)
-        ax.axhline(0, color="gray", linewidth=0.8)
-        ax.tick_params(axis="x", rotation=30)
+    if name == "GaussianMixture":
+        model = GaussianMixture(n_components=GMM_N_COMPONENTS,
+                                 covariance_type="diag", reg_covar=1e-3,
+                                 random_state=RANDOM_STATE)
+        model.fit(X_fit_t)
+        return -model.score_samples(X_score_t)
 
-    fig.suptitle("Validación cuantitativa con anomalías sintéticas")
-    fig.tight_layout()
-    fig.savefig("fig1_comparativa_sintetico.png", dpi=150, bbox_inches="tight")
-    print("Guardado fig1_comparativa_sintetico.png")
+    if name == "PCA (autoencoder lineal)":
+        pca = PCA(n_components=0.90, random_state=RANDOM_STATE)
+        pca.fit(X_fit_t)
+        X_rec = pca.inverse_transform(pca.transform(X_score_t))
+        return np.mean((X_score_t - X_rec) ** 2, axis=1)
 
+    if name == "Autoencoder (MLP)":
+        mlp = MLPRegressor(hidden_layer_sizes=AUTOENCODER_HIDDEN, max_iter=300,
+                            random_state=RANDOM_STATE, early_stopping=True)
+        mlp.fit(X_fit_t, X_fit_t)
+        X_rec = mlp.predict(X_score_t)
+        return np.mean((X_score_t - X_rec) ** 2, axis=1)
 
-def fig2_comparativa_cualitativo(df, agg_tipo="p95"):
-    """Barras: percentil medio y % en top 20% de los TESTS NOK reales fiables, por modelo."""
-    agg = agregar_a_nivel_test(df, agg_tipo=agg_tipo)
-    score_cols = [c for c in agg.columns if c.startswith("anomaly_score__")]
-
-    filas = []
-    for col in score_cols:
-        nombre = col.replace("anomaly_score__", "")
-        percentiles = agg[col].rank(pct=True)
-        filas.append({
-            "modelo": nombre,
-            "percentil_medio_NOK": percentiles[agg["_nok_fiable"]].mean(),
-            "pct_NOK_en_top20%": (percentiles[agg["_nok_fiable"]] > 0.80).mean(),
-        })
-    resumen = pd.DataFrame(filas).set_index("modelo")
-    resumen = resumen.reindex([m for m in MODEL_ORDER if m in resumen.index])
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-    resumen["percentil_medio_NOK"].plot(kind="bar", ax=axes[0], color="#55A868", edgecolor="black")
-    axes[0].axhline(0.5, color="gray", linestyle="--", linewidth=1, label="azar (0.5)")
-    axes[0].set_title("Percentil medio de anomalía\nde los TESTS NOK reales fiables")
-    axes[0].legend()
-    axes[0].tick_params(axis="x", rotation=30)
-
-    resumen["pct_NOK_en_top20%"].plot(kind="bar", ax=axes[1], color="#C44E52", edgecolor="black")
-    axes[1].axhline(0.20, color="gray", linestyle="--", linewidth=1, label="azar (0.20)")
-    axes[1].set_title("% de TESTS NOK reales fiables\nen el 20% más anómalo")
-    axes[1].legend()
-    axes[1].tick_params(axis="x", rotation=30)
-
-    fig.suptitle(f"Validación cualitativa con tests NOK reales conocidos "
-                 f"(agregado por test, {agg_tipo})")
-    fig.tight_layout()
-    fig.savefig("fig2_comparativa_cualitativo.png", dpi=150, bbox_inches="tight")
-    print("Guardado fig2_comparativa_cualitativo.png")
+    raise ValueError(f"Modelo desconocido: {name}")
 
 
-def fig3_distribucion_scores(df, agg_tipo="p95"):
-    """Boxplot por modelo: distribucion de scores A NIVEL DE TEST, normal vs NOK real fiable."""
-    agg = agregar_a_nivel_test(df, agg_tipo=agg_tipo)
-    score_cols = [c for c in agg.columns if c.startswith("anomaly_score__")]
-    modelos = [m for m in MODEL_ORDER if f"anomaly_score__{m}" in score_cols] or \
-        [c.replace("anomaly_score__", "") for c in score_cols]
+def inject_synthetic_anomalies(df, n=N_SYNTHETIC, pct=PERTURBATION_PCT):
+    """
+    Copia n filas al azar (del holdout normal, NUNCA del entrenamiento) y
+    perturba SOLO sus variables de potencia medida +/- pct%, simulando un
+    sensor que se desvia de lo esperado. No se tocan nivel_F* (son la
+    configuracion comandada, no algo que un sensor pueda "fallar") ni VIB.
+    """
+    cols_a_perturbar = [c for c in df.columns if "Measured_Power" in c]
+    rng = np.random.RandomState(RANDOM_STATE)
+    sample = df.sample(n=min(n, len(df)), random_state=RANDOM_STATE).copy()
 
-    fig, axes = plt.subplots(1, len(modelos), figsize=(4 * len(modelos), 4.5), sharey=False)
-    if len(modelos) == 1:
-        axes = [axes]
-
-    for ax, modelo in zip(axes, modelos):
-        col = f"anomaly_score__{modelo}"
-        normal = agg.loc[~agg["_nok_fiable"], col].dropna()
-        nok = agg.loc[agg["_nok_fiable"], col].dropna()
-        ax.boxplot([normal, nok], tick_labels=["Resto", "NOK real\nfiable"],
-                   patch_artist=True,
-                   boxprops=dict(facecolor="#DDEEFF"),
-                   medianprops=dict(color="black"))
-        ax.set_title(modelo, fontsize=10)
-        ax.set_ylabel(f"anomaly score ({agg_tipo} por test)" if ax is axes[0] else "")
-
-        if modelo == "LOF":
-            # LOF puede dar valores con varios ordenes de magnitud de
-            # diferencia por inestabilidad numerica (zonas del espacio con
-            # pocos vecinos de entrenamiento). Escala log en vez de
-            # recorte por percentiles, que aqui no basta.
-            ax.set_yscale("log")
+    for col in cols_a_perturbar:
+        if sample[col].notna().sum() == 0:
             continue
+        signo = rng.choice([-1, 1], size=len(sample))
+        factor = 1 + signo * pct * rng.uniform(0.5, 1.5, size=len(sample))
+        sample[col] = sample[col] * factor
 
-        # Otros modelos: acotar la vista a percentiles 1-99 de ambos
-        # grupos juntos para que valores extremos puntuales no aplasten
-        # la escala del boxplot (el dato extremo sigue existiendo, solo
-        # se recorta la vista).
-        combinado = pd.concat([normal, nok])
-        p1, p99 = combinado.quantile([0.01, 0.99])
-        margen = (p99 - p1) * 0.15 or 1
-        ax.set_ylim(p1 - margen, p99 + margen)
-        if combinado.max() > p99 + margen or combinado.min() < p1 - margen:
-            ax.text(0.5, 0.02, "(vista recortada a percentiles 1-99;\n"
-                                "hay valores extremos puntuales fuera de rango)",
-                    transform=ax.transAxes, ha="center", va="bottom",
-                    fontsize=7, color="gray")
-
-    fig.suptitle(f"Distribución del score de anomalía por TEST ({agg_tipo}): "
-                 f"normal vs. NOK real conocido")
-    fig.tight_layout()
-    fig.savefig("fig3_distribucion_scores.png", dpi=150, bbox_inches="tight")
-    print("Guardado fig3_distribucion_scores.png")
+    sample["_synthetic"] = 1
+    df = df.copy()
+    df["_synthetic"] = 0
+    return pd.concat([df, sample], ignore_index=True)
 
 
-def fig4_caso_ejemplo(df, snr_ejemplo=None):
+def qualitative_check(df_eval, scores_dict, nok_mask):
     """
-    Evolucion del score de anomalia a lo largo de los subciclos para un
-    caso NOK real, comparado con un caso OK del mismo TestName/VIB.
-    Util como ilustracion cualitativa concreta en la memoria.
+    Compara los TESTS NOK reales fiables contra los tests normales del
+    holdout, agregando el score de anomalia POR TEST (maximo y percentil
+    95 de sus subciclos) -- NO subciclo a subciclo.
+
+    Esto es importante: un test etiquetado NOK puede haber fallado por el
+    comportamiento de un UNICO subciclo, no todos. Tratar cada subciclo de
+    un test NOK como "anomalo" por igual seria una etiqueta incorrecta
+    (la mayoria de sus subciclos probablemente sean perfectamente
+    normales). Al agregar por test, el subciclo que realmente disparo el
+    fallo domina el score final (via el maximo/percentil 95), sin
+    penalizar al modelo por el resto de subciclos normales de ese mismo
+    test.
     """
-    casos_nok = df[df["_nok_fiable"]]
-    if casos_nok.empty:
-        print("No hay casos NOK fiables para el ejemplo, se omite fig4.")
+    df_eval = df_eval.copy()
+    df_eval["_es_nok"] = nok_mask
+    for name, scores in scores_dict.items():
+        df_eval[f"score_{name}"] = scores
+
+    grp = df_eval.groupby(["SNR", "VIB", "TestName"])
+    score_cols = [f"score_{name}" for name in scores_dict]
+
+    agg_max = grp[score_cols].max()
+    agg_max.columns = [f"{c}__max" for c in agg_max.columns]
+    agg_p95 = grp[score_cols].quantile(0.95)
+    agg_p95.columns = [f"{c}__p95" for c in agg_p95.columns]
+    es_nok_test = grp["_es_nok"].max().astype(bool)
+
+    agg = pd.concat([agg_max, agg_p95, es_nok_test], axis=1).reset_index()
+
+    n_tests_nok = int(agg["_es_nok"].sum())
+    n_tests_total = len(agg)
+    print(f"\n===== Chequeo cualitativo A NIVEL DE TEST ({n_tests_nok} NOK de "
+          f"{n_tests_total} tests, agregando subciclos por maximo/percentil 95) =====")
+
+    if n_tests_nok == 0:
+        print("[AVISO] No hay tests NOK fiables en el conjunto de evaluacion.")
         return
 
-    if snr_ejemplo is None:
-        # cogemos el SNR con mas subciclos disponibles, para un ejemplo mas rico
-        snr_ejemplo = casos_nok["SNR"].value_counts().idxmax()
+    resumen = []
+    for name in scores_dict:
+        for agg_tipo in ["max", "p95"]:
+            col = f"score_{name}__{agg_tipo}"
+            percentiles = agg[col].rank(pct=True)
+            resumen.append({
+                "modelo": name,
+                "agregado": agg_tipo,
+                "percentil_medio_NOK": percentiles[agg["_es_nok"]].mean(),
+                "pct_NOK_en_top20%": (percentiles[agg["_es_nok"]] > 0.80).mean(),
+            })
+    print(pd.DataFrame(resumen).to_string(index=False))
+    print("\n(Referencia azar: percentil_medio=0.50, pct_en_top20%=0.20)")
 
-    fila_ref = casos_nok[casos_nok["SNR"] == snr_ejemplo].iloc[0]
-    test_name, vib = fila_ref["TestName"], fila_ref["VIB"]
 
-    caso_nok = df[(df["SNR"] == snr_ejemplo)].sort_values("Subcycle")
-
-    # un OK cualquiera del mismo TestName/VIB, como referencia de "normalidad"
-    candidatos_ok = df[
-        (df["TestName"] == test_name) & (df["VIB"] == vib)
-        & (df["Resultado"].astype(str).str.upper() == "OK")
-    ]
-    snr_ok = candidatos_ok["SNR"].iloc[0] if not candidatos_ok.empty else None
-    caso_ok = df[df["SNR"] == snr_ok].sort_values("Subcycle") if snr_ok else None
-
-    score_cols = [c for c in df.columns if c.startswith("anomaly_score__")]
-    modelos = [m for m in MODEL_ORDER if f"anomaly_score__{m}" in score_cols] or \
-        [c.replace("anomaly_score__", "") for c in score_cols]
-
-    fig, axes = plt.subplots(len(modelos), 1, figsize=(8, 3 * len(modelos)), sharex=True)
-    if len(modelos) == 1:
-        axes = [axes]
-
-    for ax, modelo in zip(axes, modelos):
-        col = f"anomaly_score__{modelo}"
-        ax.plot(caso_nok["Subcycle"], caso_nok[col], marker="o", color="#C44E52",
-                 label=f"NOK real (SNR {snr_ejemplo})")
-        if caso_ok is not None:
-            ax.plot(caso_ok["Subcycle"], caso_ok[col], marker="o", color="#55A868",
-                     label=f"OK (SNR {snr_ok})")
-        ax.set_ylabel(modelo, fontsize=9)
-        ax.legend(fontsize=8)
-        if modelo == "LOF":
-            ax.set_yscale("log")
-
-    axes[-1].set_xlabel("Subciclo")
-    fig.suptitle(f"Evolución del score de anomalía por subciclo\nTest: {test_name}")
-    fig.tight_layout()
-    fig.savefig("fig4_caso_ejemplo.png", dpi=150, bbox_inches="tight")
-    print("Guardado fig4_caso_ejemplo.png")
+def evaluate_synthetic(scores_dict, is_synthetic):
+    results = []
+    for name, scores in scores_dict.items():
+        auc_roc = roc_auc_score(is_synthetic, scores)
+        auc_pr = average_precision_score(is_synthetic, scores)
+        results.append({"modelo": name, "auc_roc_sintetico": auc_roc,
+                         "auc_pr_sintetico": auc_pr})
+    return pd.DataFrame(results).sort_values("auc_pr_sintetico", ascending=False)
 
 
 def main():
-    df = cargar_datos()
-    fig1_comparativa_sintetico()
-    fig2_comparativa_cualitativo(df)
-    fig3_distribucion_scores(df)
-    fig4_caso_ejemplo(df)
+    df, feature_cols, cat_cols, num_cols = load_data()
+    print(f"Dataset: {df.shape[0]} filas (test x subciclo)")
+
+    claves_fiables = load_casos_fiables()
+    es_nok = df["Resultado"].astype(str).str.upper().isin(["NOK_FUNC", "NOK_FUNC_EST"])
+    if claves_fiables is not None:
+        es_fiable = df.apply(
+            lambda r: (r["SNR"], r["VIB"], r["TestName"]) in claves_fiables, axis=1
+        )
+    else:
+        es_fiable = pd.Series(False, index=df.index)
+    df["_nok_fiable"] = es_nok & es_fiable
+    print(f"Casos NOK reales fiables: {df['_nok_fiable'].sum()} filas, "
+          f"{df.loc[df['_nok_fiable'], ['SNR','VIB','TestName']].drop_duplicates().shape[0]} tests")
+
+    # --- 1) Entrenamiento SOLO con datos normales (excluye TODO lo NOK,
+    # fiable o no, para no contaminar la definicion de "normal") ---
+    df_ok = df[df["Resultado"].astype(str).str.upper() == "OK"].reset_index(drop=True)
+
+    # --- 2) Split train/holdout dentro de lo normal, para validar
+    # out-of-sample de verdad ---
+    rng = np.random.RandomState(RANDOM_STATE)
+    idx = rng.permutation(len(df_ok))
+    n_holdout = int(len(df_ok) * HOLDOUT_FRACTION)
+    df_holdout_normal = df_ok.iloc[idx[:n_holdout]].reset_index(drop=True)
+    df_train = df_ok.iloc[idx[n_holdout:]].reset_index(drop=True)
+
+    df_nok_fiable = df[df["_nok_fiable"]].reset_index(drop=True)
+
+    print(f"Entrenamiento (solo normal, {1-HOLDOUT_FRACTION:.0%}): {len(df_train)} filas")
+    print(f"Holdout normal (no visto en entrenamiento): {len(df_holdout_normal)} filas")
+
+    # --- Chequeo cualitativo: holdout normal + NOK reales, ambos
+    # out-of-sample (el modelo se entreno solo con df_train) ---
+    df_eval_qual = pd.concat([df_holdout_normal, df_nok_fiable], ignore_index=True)
+    nok_mask_qual = np.zeros(len(df_eval_qual), dtype=bool)
+    nok_mask_qual[len(df_holdout_normal):] = True
+
+    scores_qual = {}
+    for name in MODELOS:
+        print(f"Entrenando {name} (chequeo cualitativo)...")
+        scores_qual[name] = compute_scores(
+            name, df_train[feature_cols], df_eval_qual[feature_cols], cat_cols, num_cols
+        )
+    qualitative_check(df_eval_qual, scores_qual, nok_mask_qual)
+
+    # --- 3) Validacion cuantitativa con sinteticas, out-of-sample de
+    # verdad: se perturban SOLO filas del holdout, nunca del entrenamiento ---
+    print("\nInyectando anomalias sinteticas sobre el holdout (out-of-sample)...")
+    df_holdout_aug = inject_synthetic_anomalies(df_holdout_normal)
+
+    scores_synth = {}
+    for name in MODELOS:
+        print(f"Entrenando {name} (validacion sintetica)...")
+        scores_synth[name] = compute_scores(
+            name, df_train[feature_cols], df_holdout_aug[feature_cols], cat_cols, num_cols
+        )
+
+    resultados = evaluate_synthetic(scores_synth, df_holdout_aug["_synthetic"].values)
+    print("\n===== TABLA COMPARATIVA (validacion con anomalias sinteticas, out-of-sample) =====")
+    print(resultados.to_string(index=False))
+    resultados.to_csv("comparacion_modelos_anomalias.csv", index=False)
+
+    # --- Puntuar TODO el dataset para la app/graficas, reentrenando sobre
+    # TODOS los datos normales disponibles (train+holdout) para
+    # aprovechar el maximo de datos en el modelo final ---
+    print("\nEntrenando modelos finales sobre todo lo normal, puntuando dataset completo...")
+    for name in MODELOS:
+        df[f"anomaly_score__{name}"] = compute_scores(
+            name, df_ok[feature_cols], df[feature_cols], cat_cols, num_cols
+        )
+
+    df.to_parquet("subciclos_con_scores.parquet", index=False)
+    print("\nGuardado subciclos_con_scores.parquet con los scores de cada modelo")
+
+    # --- Definicion operativa de "anomalia": percentil respecto a la
+    # distribucion de scores de los tests NORMALES conocidos (no el
+    # mecanismo interno de cada modelo, que no es consistente entre
+    # ellos: IsolationForest/LOF usan score_samples() directamente, donde
+    # 'contamination' no tiene ningun efecto; solo OneClassSVM usa 'nu' de
+    # forma que si afecta a la frontera aprendida; GMM/PCA/autoencoder no
+    # tienen ningun concepto de contaminacion). El umbral de alerta
+    # (percentil 80) viene de la validacion cualitativa: con
+    # OneClassSVM/p95 capturaba mas de la mitad de los NOK reales
+    # revisando solo el 20% mas anomalo.
+    UMBRAL_ALERTA = 0.80
+    es_ok_mask = df["Resultado"].astype(str).str.upper() == "OK"
+    referencias = {}
+    for name in MODELOS:
+        # la distribucion de referencia es la de los propios tests
+        # normales ya puntuados arriba -- no hace falta reentrenar nada mas
+        referencia = np.sort(df.loc[es_ok_mask, f"anomaly_score__{name}"].values)
+        referencias[name] = referencia
+        percentil = np.searchsorted(referencia, df[f"anomaly_score__{name}"]) / len(referencia)
+        df[f"percentil__{name}"] = percentil
+        df[f"alerta__{name}"] = percentil > UMBRAL_ALERTA
+
+    df.to_parquet("subciclos_con_scores.parquet", index=False)
+    np.savez("referencia_scores_normal.npz", **referencias)
+    print(f"Definicion de alerta: percentil > {UMBRAL_ALERTA} respecto a tests normales.")
+    print("Guardado referencia_scores_normal.npz -- distribucion de referencia fija "
+          "para calcular el percentil de tests nuevos en la app (no recalcular contra "
+          "un grupo que cambie cada vez, o el mismo test cambiaria de percentil sin "
+          "haber cambiado el).")
+
+    # --- Anomalias sinteticas puntuadas por el modelo FINAL (entrenado
+    # con todos los datos normales), para poder compararlas como una
+    # tercera categoria junto a "Resto" y "NOK real" en las graficas.
+    # Cada sintetica recibe un SNR/TestName UNICO: asi, cuando las
+    # graficas agreguen por (SNR,VIB,TestName), cada una forma su propio
+    # grupo de una sola fila y su valor agregado (max/p95) es
+    # simplemente su propio score, sin distorsion.
+    print("\nGenerando anomalias sinteticas puntuadas por el modelo final...")
+    df_sint_aug = inject_synthetic_anomalies(df_ok)
+    df_sint = df_sint_aug[df_sint_aug["_synthetic"] == 1].reset_index(drop=True)
+    df_sint["SNR"] = [f"SINT_{i}" for i in range(len(df_sint))]
+    df_sint["TestName"] = [f"SINT_TEST_{i}" for i in range(len(df_sint))]
+    df_sint["Resultado"] = "NOK_SINTETICO"
+
+    for name in MODELOS:
+        df_sint[f"anomaly_score__{name}"] = compute_scores(
+            name, df_ok[feature_cols], df_sint[feature_cols], cat_cols, num_cols
+        )
+
+    df_sint.to_parquet("sinteticos_con_scores.parquet", index=False)
+    print("Guardado sinteticos_con_scores.parquet")
 
 
 if __name__ == "__main__":
