@@ -7,8 +7,12 @@ por test entero. Cada fila incluye:
     ya usa app2.py -- NO se infiere de SbRep.Subcycle, que es solo un
     indice de orden de ejecucion sin informacion de configuracion.
   - estadisticos (mean/std/min/max) de las variables de potencia (y
-    temperatura si existe) para ese subciclo concreto, dentro de la
-    ventana temprana del test.
+    temperatura si existe) para ese subciclo concreto.
+
+NOTA: ya no se restringe a una "ventana temprana" -- se usa toda la
+duracion disponible de cada test. El objetivo dejo de ser "alerta
+temprana" y paso a ser deteccion general de comportamiento anomalo, asi
+que maximizamos volumen de entrenamiento en vez de limitarlo.
 
 Requiere:
     pip install pandas pyodbc sqlalchemy tqdm
@@ -41,8 +45,6 @@ CONN_STR_QITDB = (
 )
 
 ENSAYOS_CSV = "ensayos_ipr_todos.csv"
-
-EARLY_FRACTION = 0.40   # ver nota en scripts anteriores sobre IPR vs FIA
 
 # Ya no filtramos variables desde Python: la query usa
 # VA.Variable_Name LIKE 'Measured_Power%' directamente en SQL, así cogemos
@@ -148,22 +150,9 @@ def canonical_name(var_name):
     return var_name
 
 
-def compute_reference_duration(ensayos):
-    """Duracion de referencia (mediana global de OK) para fijar el corte
-    de la ventana temprana sin fuga de informacion (ver script anterior)."""
-    ok = ensayos[ensayos["Resultado"].astype(str).str.upper() == "OK"].copy()
-    ok["duracion_h"] = (
-        pd.to_datetime(ok["FechaFin"]) - pd.to_datetime(ok["FechaInicio"])
-    ).dt.total_seconds() / 3600
-    return ok["duracion_h"].median()
-
-
 def main():
     ensayos = pd.read_csv(ENSAYOS_CSV, dtype={"FD": str, "SNR": str, "VIB": str, "TestName": str})
     print(f"Tests a procesar: {len(ensayos)}")
-
-    ref_duration = compute_reference_duration(ensayos)
-    print(f"Duracion de referencia (mediana OK): {ref_duration:.1f} h")
 
     engine = create_engine(CONN_STR)
     engine_qitdb = create_engine(CONN_STR_QITDB)
@@ -180,10 +169,14 @@ def main():
     all_rows = []
     for _, row in tqdm(ensayos.iterrows(), total=len(ensayos)):
         fecha_inicio = pd.to_datetime(row["FechaInicio"])
-        cutoff = fecha_inicio + pd.Timedelta(hours=ref_duration * EARLY_FRACTION)
+        # Ya no restringimos a una ventana temprana: cogemos todo el rango
+        # disponible del test (hasta FechaFin si ya acabo, o "ahora" si
+        # sigue en curso). Ya no buscamos alerta temprana, solo detectar
+        # comportamiento anomalo en general, así que maximizamos volumen.
+        fecha_fin = pd.to_datetime(row["FechaFin"]) if pd.notna(row["FechaFin"]) else pd.Timestamp.now()
 
         params = [str(row["SNR"]).zfill(10), str(row["FD"]).zfill(10), row["VIB"], row["TestName"],
-                   fecha_inicio, cutoff]
+                   fecha_inicio, fecha_fin]
         try:
             df = pd.read_sql(query, engine, params=params)
         except Exception as e:
