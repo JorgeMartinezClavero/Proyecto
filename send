@@ -1,49 +1,27 @@
-"""
-Cruza los tests de Ensayos con UltimoSubciclo > N (proxy de "el fallo se
-determino tras suficiente operacion real, no un aborto administrativo
-temprano") con los datos ya extraidos en subciclos_features.parquet, para
-ver cuantos de esos casos son realmente utilizables para el chequeo
-cualitativo, sin volver a tocar la base de datos.
+-- Poblacion completa de tests IPR desde que la BBDD actual graba bien.
+-- A diferencia de la extraccion anterior, AQUI NO filtramos por Estado ni
+-- por Resultado: para entrenar el modelo de anomalias no necesitamos
+-- etiqueta, y cuantos mas tests "normales" incluyamos (incluso en curso),
+-- mejor aprende el modelo que es comportamiento tipico.
+-- Resultado se conserva solo para la validacion cualitativa posterior
+-- (comprobar si los pocos NOK reales conocidos puntuan como anomalos).
 
-Uso:
-    python check_casos_reliables.py
-"""
+SELECT
+    ID,
+    VIB,
+    FD,
+    SNR,
+    Ciclo AS TestName,
+    FechaInicio,
+    FechaFin,
+    Subciclo AS UltimoSubciclo,
+    Repeticion AS UltimaRepeticion,
+    Estado,
+    Resultado
+FROM QIT_DB.dbo.Ensayos
+WHERE Area = 'IPR'
+  AND (Eliminado IS NULL OR Eliminado = 0)
+  AND FechaInicio >= '2026-04-09'
+ORDER BY FechaInicio;
 
-import pandas as pd
-
-ENSAYOS_CSV = "ensayos_ipr_todos.csv"
-FEATURES_PARQUET = "subciclos_features.parquet"
-MIN_SUBCICLO = 10  # ajusta el umbral si quieres probar otro
-
-
-def main():
-    ensayos = pd.read_csv(ENSAYOS_CSV, sep=';',
-                           dtype={"FD": str, "SNR": str, "VIB": str, "TestName": str})
-
-    # UltimoSubciclo es el nombre de columna si usaste 01/03_extract_ensayos*.sql
-    col_subciclo = "UltimoSubciclo" if "UltimoSubciclo" in ensayos.columns else "Subciclo"
-
-    candidatos = ensayos[ensayos[col_subciclo] > MIN_SUBCICLO].copy()
-    print(f"Tests en Ensayos con {col_subciclo} > {MIN_SUBCICLO}: {len(candidatos)}")
-    print(candidatos["Resultado"].value_counts(dropna=False))
-
-    df_features = pd.read_parquet(FEATURES_PARQUET)
-
-    # Claves unicas presentes de verdad en el parquet extraido
-    claves_parquet = set(
-        zip(df_features["SNR"], df_features["VIB"], df_features["TestName"])
-    )
-
-    candidatos["tiene_datos"] = candidatos.apply(
-        lambda r: (r["SNR"], r["VIB"], r["TestName"]) in claves_parquet, axis=1
-    )
-
-    print(f"\nDe esos, con datos reales en el parquet: {candidatos['tiene_datos'].sum()}")
-    print(candidatos.groupby(["Resultado", "tiene_datos"]).size())
-
-    candidatos.to_csv("candidatos_subciclo_alto.csv", index=False)
-    print("\nGuardado candidatos_subciclo_alto.csv para revisar caso a caso")
-
-
-if __name__ == "__main__":
-    main()
+-- Exportar como ensayos_ipr_todos.csv (recuerda activar cabeceras al guardar)
