@@ -1,18 +1,32 @@
 """
-Resume el chequeo cualitativo a partir de subciclos_con_scores.parquet
-(ya generado por 05_train_anomaly_models.py), sin necesidad de reentrenar.
+Genera las graficas principales para el capitulo de resultados, a partir
+de los ficheros ya generados por 05_train_anomaly_models.py (no hace
+falta reentrenar nada).
+
+Requiere:
+    pip install pandas matplotlib
 
 Uso:
-    python resumen_chequeo_cualitativo.py
+    python 06_generar_graficas.py
+Salida (todo en la carpeta actual):
+    fig1_comparativa_sintetico.png
+    fig2_comparativa_cualitativo.png
+    fig3_distribucion_scores.png
+    fig4_caso_ejemplo.png
 """
 
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 
 SCORES_PARQUET = "subciclos_con_scores.parquet"
 CANDIDATOS_CSV = "candidatos_subciclo_alto.csv"
+SINTETICO_CSV = "comparacion_modelos_anomalias.csv"
+
+MODEL_ORDER = ["IsolationForest", "OneClassSVM", "LOF", "PCA (autoencoder lineal)"]
 
 
-def main():
+def cargar_datos():
     df = pd.read_parquet(SCORES_PARQUET)
     candidatos = pd.read_csv(
         CANDIDATOS_CSV, dtype={"SNR": str, "VIB": str, "TestName": str, "FD": str}
@@ -22,26 +36,155 @@ def main():
 
     es_nok = df["Resultado"].astype(str).str.upper().isin(["NOK_FUNC", "NOK_FUNC_EST"])
     es_fiable = df.apply(lambda r: (r["SNR"], r["VIB"], r["TestName"]) in claves_fiables, axis=1)
-    nok_mask = es_nok & es_fiable
+    df["_nok_fiable"] = es_nok & es_fiable
+    return df
 
-    casos = df.loc[nok_mask]
-    print(f"Filas (subciclos) NOK fiables: {len(casos)}")
-    print(f"SNR distintos detras de esos casos: {casos['SNR'].nunique()}")
-    print("\nSubciclos por SNR:")
-    print(casos.groupby("SNR")["Subcycle"].count())
+
+def fig1_comparativa_sintetico():
+    """Barras: AUC-ROC y AUC-PR de la validacion con anomalias sinteticas."""
+    resultados = pd.read_csv(SINTETICO_CSV).set_index("modelo")
+    orden = [m for m in MODEL_ORDER if m in resultados.index]
+    resultados = resultados.reindex(orden)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    for ax, col, titulo in zip(
+        axes, ["auc_roc_sintetico", "auc_pr_sintetico"],
+        ["AUC-ROC (anomalias sinteticas)", "AUC-PR (anomalias sinteticas)"]
+    ):
+        resultados[col].plot(kind="bar", ax=ax, color="#4C72B0", edgecolor="black")
+        ax.set_title(titulo)
+        ax.set_xlabel("")
+        ax.set_ylabel(col)
+        ax.axhline(0, color="gray", linewidth=0.8)
+        ax.tick_params(axis="x", rotation=30)
+
+    fig.suptitle("Validación cuantitativa con anomalías sintéticas")
+    fig.tight_layout()
+    fig.savefig("fig1_comparativa_sintetico.png", dpi=150, bbox_inches="tight")
+    print("Guardado fig1_comparativa_sintetico.png")
+
+
+def fig2_comparativa_cualitativo(df):
+    """Barras: percentil medio y % en top 20% de los NOK reales fiables, por modelo."""
+    score_cols = [c for c in df.columns if c.startswith("anomaly_score__")]
+
+    filas = []
+    for col in score_cols:
+        nombre = col.replace("anomaly_score__", "")
+        percentiles = df[col].rank(pct=True)
+        filas.append({
+            "modelo": nombre,
+            "percentil_medio_NOK": percentiles[df["_nok_fiable"]].mean(),
+            "pct_NOK_en_top20%": (percentiles[df["_nok_fiable"]] > 0.80).mean(),
+        })
+    resumen = pd.DataFrame(filas).set_index("modelo")
+    resumen = resumen.reindex([m for m in MODEL_ORDER if m in resumen.index])
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    resumen["percentil_medio_NOK"].plot(kind="bar", ax=axes[0], color="#55A868", edgecolor="black")
+    axes[0].axhline(0.5, color="gray", linestyle="--", linewidth=1, label="azar (0.5)")
+    axes[0].set_title("Percentil medio de anomalía\nde los NOK reales fiables")
+    axes[0].legend()
+    axes[0].tick_params(axis="x", rotation=30)
+
+    resumen["pct_NOK_en_top20%"].plot(kind="bar", ax=axes[1], color="#C44E52", edgecolor="black")
+    axes[1].axhline(0.20, color="gray", linestyle="--", linewidth=1, label="azar (0.20)")
+    axes[1].set_title("% de NOK reales fiables\nen el 20% más anómalo")
+    axes[1].legend()
+    axes[1].tick_params(axis="x", rotation=30)
+
+    fig.suptitle("Validación cualitativa con casos NOK reales conocidos")
+    fig.tight_layout()
+    fig.savefig("fig2_comparativa_cualitativo.png", dpi=150, bbox_inches="tight")
+    print("Guardado fig2_comparativa_cualitativo.png")
+
+
+def fig3_distribucion_scores(df):
+    """Boxplot por modelo: distribucion de scores, normal vs NOK real fiable."""
+    score_cols = [c for c in df.columns if c.startswith("anomaly_score__")]
+    modelos = [m for m in MODEL_ORDER if f"anomaly_score__{m}" in score_cols] or \
+        [c.replace("anomaly_score__", "") for c in score_cols]
+
+    fig, axes = plt.subplots(1, len(modelos), figsize=(4 * len(modelos), 4.5), sharey=False)
+    if len(modelos) == 1:
+        axes = [axes]
+
+    for ax, modelo in zip(axes, modelos):
+        col = f"anomaly_score__{modelo}"
+        normal = df.loc[~df["_nok_fiable"], col].dropna()
+        nok = df.loc[df["_nok_fiable"], col].dropna()
+        ax.boxplot([normal, nok], tick_labels=["Resto", "NOK real\nfiable"],
+                   patch_artist=True,
+                   boxprops=dict(facecolor="#DDEEFF"),
+                   medianprops=dict(color="black"))
+        ax.set_title(modelo, fontsize=10)
+        ax.set_ylabel("anomaly score" if ax is axes[0] else "")
+
+    fig.suptitle("Distribución del score de anomalía: normal vs. NOK real conocido")
+    fig.tight_layout()
+    fig.savefig("fig3_distribucion_scores.png", dpi=150, bbox_inches="tight")
+    print("Guardado fig3_distribucion_scores.png")
+
+
+def fig4_caso_ejemplo(df, snr_ejemplo=None):
+    """
+    Evolucion del score de anomalia a lo largo de los subciclos para un
+    caso NOK real, comparado con un caso OK del mismo TestName/VIB.
+    Util como ilustracion cualitativa concreta en la memoria.
+    """
+    casos_nok = df[df["_nok_fiable"]]
+    if casos_nok.empty:
+        print("No hay casos NOK fiables para el ejemplo, se omite fig4.")
+        return
+
+    if snr_ejemplo is None:
+        # cogemos el SNR con mas subciclos disponibles, para un ejemplo mas rico
+        snr_ejemplo = casos_nok["SNR"].value_counts().idxmax()
+
+    fila_ref = casos_nok[casos_nok["SNR"] == snr_ejemplo].iloc[0]
+    test_name, vib = fila_ref["TestName"], fila_ref["VIB"]
+
+    caso_nok = df[(df["SNR"] == snr_ejemplo)].sort_values("Subcycle")
+
+    # un OK cualquiera del mismo TestName/VIB, como referencia de "normalidad"
+    candidatos_ok = df[
+        (df["TestName"] == test_name) & (df["VIB"] == vib)
+        & (df["Resultado"].astype(str).str.upper() == "OK")
+    ]
+    snr_ok = candidatos_ok["SNR"].iloc[0] if not candidatos_ok.empty else None
+    caso_ok = df[df["SNR"] == snr_ok].sort_values("Subcycle") if snr_ok else None
 
     score_cols = [c for c in df.columns if c.startswith("anomaly_score__")]
-    print("\n===== Percentil de anomalia de los casos NOK fiables, por modelo =====")
-    resumen = []
-    for col in score_cols:
-        percentiles = df[col].rank(pct=True)
-        resumen.append({
-            "modelo": col.replace("anomaly_score__", ""),
-            "percentil_medio_NOK": percentiles[nok_mask].mean(),
-            "percentil_mediana_NOK": percentiles[nok_mask].median(),
-            "pct_NOK_en_top20%": (percentiles[nok_mask] > 0.80).mean(),
-        })
-    print(pd.DataFrame(resumen).to_string(index=False))
+    modelos = [m for m in MODEL_ORDER if f"anomaly_score__{m}" in score_cols] or \
+        [c.replace("anomaly_score__", "") for c in score_cols]
+
+    fig, axes = plt.subplots(len(modelos), 1, figsize=(8, 3 * len(modelos)), sharex=True)
+    if len(modelos) == 1:
+        axes = [axes]
+
+    for ax, modelo in zip(axes, modelos):
+        col = f"anomaly_score__{modelo}"
+        ax.plot(caso_nok["Subcycle"], caso_nok[col], marker="o", color="#C44E52",
+                 label=f"NOK real (SNR {snr_ejemplo})")
+        if caso_ok is not None:
+            ax.plot(caso_ok["Subcycle"], caso_ok[col], marker="o", color="#55A868",
+                     label=f"OK (SNR {snr_ok})")
+        ax.set_ylabel(modelo, fontsize=9)
+        ax.legend(fontsize=8)
+
+    axes[-1].set_xlabel("Subciclo")
+    fig.suptitle(f"Evolución del score de anomalía por subciclo\nTest: {test_name}")
+    fig.tight_layout()
+    fig.savefig("fig4_caso_ejemplo.png", dpi=150, bbox_inches="tight")
+    print("Guardado fig4_caso_ejemplo.png")
+
+
+def main():
+    df = cargar_datos()
+    fig1_comparativa_sintetico()
+    fig2_comparativa_cualitativo(df)
+    fig3_distribucion_scores(df)
+    fig4_caso_ejemplo(df)
 
 
 if __name__ == "__main__":
