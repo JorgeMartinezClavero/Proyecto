@@ -1,9 +1,25 @@
-SELECT VA.Variable_Name, COUNT(DISTINCT TIP.TestName) AS n_tests_distintos
-FROM Measurement_all AS m
-JOIN VA ON m.ID_VA = VA.ID_VA
-JOIN Sequence AS seq ON m.ID_Sequence = seq.ID_Sequence
-JOIN SbRep ON seq.ID_SbRep = SbRep.ID_SbRep
-JOIN TIP ON SbRep.ID_TIP = TIP.ID_TIP
-WHERE seq.TimeStamp >= '2026-04-09'
-GROUP BY VA.Variable_Name
-ORDER BY n_tests_distintos DESC;
+-- Poblacion completa de tests IPR desde que la BBDD actual graba bien.
+-- A diferencia de la extraccion anterior, AQUI NO filtramos por Estado ni
+-- por Resultado: para entrenar el modelo de anomalias no necesitamos
+-- etiqueta, y cuantos mas tests "normales" incluyamos (incluso en curso),
+-- mejor aprende el modelo que es comportamiento tipico.
+-- Resultado se conserva solo para la validacion cualitativa posterior
+-- (comprobar si los pocos NOK reales conocidos puntuan como anomalos).
+
+SELECT
+    ID,
+    VIB,
+    FD,
+    SNR,
+    Ciclo AS TestName,
+    FechaInicio,
+    FechaFin,
+    Estado,
+    Resultado
+FROM QIT_DB.dbo.Ensayos
+WHERE Area = 'IPR'
+  AND (Eliminado IS NULL OR Eliminado = 0)
+  AND FechaInicio >= '2026-04-09'
+ORDER BY FechaInicio;
+
+-- Exportar como ensayos_ipr_todos.csv (recuerda activar cabeceras al guardar)
