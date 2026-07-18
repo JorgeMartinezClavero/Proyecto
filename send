@@ -67,14 +67,19 @@ def build_preprocessor(cat_cols, num_cols):
 
 def inject_synthetic_anomalies(df, num_cols, n=N_SYNTHETIC, pct=PERTURBATION_PCT):
     """
-    Copia n filas al azar y perturba sus variables numericas +/- pct%,
-    simulando un sensor que se desvia de lo esperado. Sirve como conjunto
-    de validacion cuantitativo dado que apenas hay NOK reales.
+    Copia n filas al azar y perturba SOLO sus variables de potencia medida
+    (mean/std/min/max de Measured_Power_*) +/- pct%, simulando un sensor
+    que se desvia de lo esperado para esa configuracion. NO se perturban
+    las columnas nivel_F* -- esas representan la configuracion COMANDADA
+    (que fuego se pidio, no algo que un sensor pueda "fallar"); cambiarlas
+    al azar no simula una anomalia real, solo reasigna la fila a otro
+    punto de operacion valido, diluyendo la señal sintetica.
     """
+    cols_a_perturbar = [c for c in num_cols if "Measured_Power" in c]
     rng = np.random.RandomState(RANDOM_STATE)
     sample = df.sample(n=min(n, len(df)), random_state=RANDOM_STATE).copy()
 
-    for col in num_cols:
+    for col in cols_a_perturbar:
         if sample[col].notna().sum() == 0:
             continue
         signo = rng.choice([-1, 1], size=len(sample))
@@ -141,12 +146,15 @@ def load_casos_fiables():
     con datos reales y ese criterio cumplido.
     """
     try:
-        candidatos = pd.read_csv(CANDIDATOS_FIABLES_CSV)
+        candidatos = pd.read_csv(
+            CANDIDATOS_FIABLES_CSV,
+            dtype={"SNR": str, "VIB": str, "TestName": str, "FD": str},
+        )
     except FileNotFoundError:
         print(f"\n[AVISO] No se encontro {CANDIDATOS_FIABLES_CSV} -- corre antes "
               "check_casos_fiables.py. El chequeo cualitativo se omite.")
         return None
-    fiables = candidatos[candidatos["tiene_datos"] == True]
+    fiables = candidatos[candidatos["tiene_datos"].astype(str).str.lower() == "true"]
     return set(zip(fiables["SNR"], fiables["VIB"], fiables["TestName"]))
 
 
