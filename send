@@ -1,38 +1,9 @@
--- Comprobacion rapida: proporcion OK / NOK_FUNC / NOK_EST / NOK_FUNC_EST
--- en IPR, restringido a tests cuya etapa temprana puede reconstruirse
--- (arrancaron a partir de cuando la BBDD actual empieza a grabar bien).
-
-SELECT
-    Resultado,
-    COUNT(*)                                              AS n,
-    AVG(DATEDIFF(hour, FechaInicio, FechaFin))             AS horas_media,
-    MIN(FechaInicio)                                       AS primer_inicio,
-    MAX(FechaInicio)                                       AS ultimo_inicio
-FROM QIT_DB.dbo.Ensayos
-WHERE Area = 'IPR'
-  AND Resultado IS NOT NULL
-  AND (Eliminado IS NULL OR Eliminado = 0)
-  AND Estado IN (4, 5)                       -- Pendiente de Analisis, Finalizado
-  AND FechaFin IS NOT NULL
-  AND DATEDIFF(hour, FechaInicio, FechaFin) > 0
-  AND FechaInicio >= '2026-04-09'             -- arranque real de Measurement_all
-GROUP BY Resultado
-ORDER BY n DESC;
-
--- Si quieres ademas ver el total y el % de NOK de un vistazo:
---
--- SELECT
---     COUNT(*) AS total,
---     SUM(CASE WHEN Resultado = 'OK' THEN 1 ELSE 0 END) AS n_ok,
---     SUM(CASE WHEN Resultado IN ('NOK_FUNC','NOK_FUNC_EST') THEN 1 ELSE 0 END) AS n_nok_funcional,
---     SUM(CASE WHEN Resultado = 'NOK_EST' THEN 1 ELSE 0 END) AS n_nok_estetico,
---     CAST(SUM(CASE WHEN Resultado IN ('NOK_FUNC','NOK_FUNC_EST') THEN 1 ELSE 0 END) AS FLOAT)
---         / COUNT(*) * 100 AS pct_nok_funcional
--- FROM QIT_DB.dbo.Ensayos
--- WHERE Area = 'IPR'
---   AND Resultado IS NOT NULL
---   AND (Eliminado IS NULL OR Eliminado = 0)
---   AND Estado IN (4, 5)
---   AND FechaFin IS NOT NULL
---   AND DATEDIFF(hour, FechaInicio, FechaFin) > 0
---   AND FechaInicio >= '2026-04-09';
+SELECT VA.Variable_Name, COUNT(DISTINCT TIP.TestName) AS n_tests_distintos
+FROM Measurement_all AS m
+JOIN VA ON m.ID_VA = VA.ID_VA
+JOIN Sequence AS seq ON m.ID_Sequence = seq.ID_Sequence
+JOIN SbRep ON seq.ID_SbRep = SbRep.ID_SbRep
+JOIN TIP ON SbRep.ID_TIP = TIP.ID_TIP
+WHERE seq.TimeStamp >= '2026-04-09'
+GROUP BY VA.Variable_Name
+ORDER BY n_tests_distintos DESC;
