@@ -6,8 +6,8 @@ por test entero. Cada fila incluye:
     QIT2_Ciclos_Subciclos/QIT2_Ciclos), parseado con el mismo regex que
     ya usa app2.py -- NO se infiere de SbRep.Subcycle, que es solo un
     indice de orden de ejecucion sin informacion de configuracion.
-  - estadisticos (mean/std/min/max) de las variables de potencia (y
-    temperatura si existe) para ese subciclo concreto.
+  - estadisticos (mean/std/min/max) de las variables de potencia
+    (Measured_Power_*) para ese subciclo concreto.
 
 NOTA: ya no se restringe a una "ventana temprana" -- se usa toda la
 duracion disponible de cada test. El objetivo dejo de ser "alerta
@@ -54,7 +54,6 @@ ENSAYOS_CSV = "ensayos_ipr_todos.csv"
 # Regex mas tolerante: cualquier cosa entre "Measured_Power_" y el sufijo
 # final "_M{numero}" se toma como identificador canonico del fuego.
 VAR_PATTERN = re.compile(r"^Measured_Power_(.+?)_M\d+$")
-TEMP_PATTERN = re.compile(r"^Temperature_Glass_(.+?)_M\d+$")
 
 # Mismo regex que ya usa la app para extraer niveles de fuego del NOMBRE
 # del subciclo (campo QIT2_Subciclos.Nombre, no SbRep.Subcycle)
@@ -166,20 +165,16 @@ def build_query():
       AND TIP.TestName = ?
       AND seq.TimeStamp >= ?
       AND seq.TimeStamp < ?
-      AND (VA.Variable_Name LIKE 'Measured_Power%'
-           OR VA.Variable_Name LIKE 'Temperature_Glass%')
+      AND VA.Variable_Name LIKE 'Measured_Power%'
     GROUP BY SbRep.Subcycle, SbRep.Repetition, VA.Variable_Name
     """
 
 
 def canonical_name(var_name):
-    """Measured_Power_F3_M80 -> Power_F3 ; Temperature_Glass_F3_M80 -> Temp_F3"""
+    """Measured_Power_F3_M80 -> Power_F3 (el modulo M70/M80/etc. no importa)"""
     m = VAR_PATTERN.match(var_name)
     if m:
         return f"Power_{m.group(1)}"
-    m = TEMP_PATTERN.match(var_name)
-    if m:
-        return f"Temp_{m.group(1)}"
     return var_name
 
 
