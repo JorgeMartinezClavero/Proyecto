@@ -159,7 +159,7 @@ def compute_reference_duration(ensayos):
 
 
 def main():
-    ensayos = pd.read_csv(ENSAYOS_CSV)
+    ensayos = pd.read_csv(ENSAYOS_CSV, dtype={"FD": str, "SNR": str, "VIB": str, "TestName": str})
     print(f"Tests a procesar: {len(ensayos)}")
 
     ref_duration = compute_reference_duration(ensayos)
@@ -182,7 +182,7 @@ def main():
         fecha_inicio = pd.to_datetime(row["FechaInicio"])
         cutoff = fecha_inicio + pd.Timedelta(hours=ref_duration * EARLY_FRACTION)
 
-        params = [row["SNR"], row["FD"], row["VIB"], row["TestName"],
+        params = [str(row["SNR"]).zfill(10), str(row["FD"]).zfill(10), row["VIB"], row["TestName"],
                    fecha_inicio, cutoff]
         try:
             df = pd.read_sql(query, engine, params=params)
