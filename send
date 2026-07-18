@@ -195,38 +195,58 @@ def inject_synthetic_anomalies(df, n=N_SYNTHETIC, pct=PERTURBATION_PCT):
 
 
 def qualitative_check(df_eval, scores_dict, nok_mask):
-    """Percentil de anomalia (respecto al holdout normal) de cada NOK real fiable."""
+    """
+    Compara los TESTS NOK reales fiables contra los tests normales del
+    holdout, agregando el score de anomalia POR TEST (maximo y percentil
+    95 de sus subciclos) -- NO subciclo a subciclo.
+
+    Esto es importante: un test etiquetado NOK puede haber fallado por el
+    comportamiento de un UNICO subciclo, no todos. Tratar cada subciclo de
+    un test NOK como "anomalo" por igual seria una etiqueta incorrecta
+    (la mayoria de sus subciclos probablemente sean perfectamente
+    normales). Al agregar por test, el subciclo que realmente disparo el
+    fallo domina el score final (via el maximo/percentil 95), sin
+    penalizar al modelo por el resto de subciclos normales de ese mismo
+    test.
+    """
     df_eval = df_eval.copy()
+    df_eval["_es_nok"] = nok_mask
     for name, scores in scores_dict.items():
         df_eval[f"score_{name}"] = scores
-        # percentil calculado SOLO respecto a las filas normales del holdout,
-        # que es la referencia real de "que tan raro es esto para un caso
-        # que el modelo nunca vio" -- no se usa el propio conjunto de NOK
-        # como referencia, para no distorsionar la escala.
-        ref_normal = scores[~nok_mask]
-        df_eval[f"percentil_{name}"] = [
-            (ref_normal < s).mean() for s in scores
-        ]
 
-    if not nok_mask.any():
-        print("\n[AVISO] No hay casos NOK fiables en el conjunto de evaluacion.")
+    grp = df_eval.groupby(["SNR", "VIB", "TestName"])
+    score_cols = [f"score_{name}" for name in scores_dict]
+
+    agg_max = grp[score_cols].max()
+    agg_max.columns = [f"{c}__max" for c in agg_max.columns]
+    agg_p95 = grp[score_cols].quantile(0.95)
+    agg_p95.columns = [f"{c}__p95" for c in agg_p95.columns]
+    es_nok_test = grp["_es_nok"].max().astype(bool)
+
+    agg = pd.concat([agg_max, agg_p95, es_nok_test], axis=1).reset_index()
+
+    n_tests_nok = int(agg["_es_nok"].sum())
+    n_tests_total = len(agg)
+    print(f"\n===== Chequeo cualitativo A NIVEL DE TEST ({n_tests_nok} NOK de "
+          f"{n_tests_total} tests, agregando subciclos por maximo/percentil 95) =====")
+
+    if n_tests_nok == 0:
+        print("[AVISO] No hay tests NOK fiables en el conjunto de evaluacion.")
         return
-
-    cols = ["SNR", "TestName", "Subcycle", "Resultado"] + \
-           [c for c in df_eval.columns if c.startswith("percentil_")]
-    print(f"\n===== {nok_mask.sum()} FILAS NOK FIABLES (holdout out-of-sample): "
-          f"percentil de anomalia por modelo =====")
-    print("(percentil cercano a 1.0 = de las mas anomalas respecto al holdout normal)")
 
     resumen = []
     for name in scores_dict:
-        pct_col = df_eval.loc[nok_mask, f"percentil_{name}"]
-        resumen.append({
-            "modelo": name,
-            "percentil_medio_NOK": pct_col.mean(),
-            "pct_NOK_en_top20%": (pct_col > 0.80).mean(),
-        })
+        for agg_tipo in ["max", "p95"]:
+            col = f"score_{name}__{agg_tipo}"
+            percentiles = agg[col].rank(pct=True)
+            resumen.append({
+                "modelo": name,
+                "agregado": agg_tipo,
+                "percentil_medio_NOK": percentiles[agg["_es_nok"]].mean(),
+                "pct_NOK_en_top20%": (percentiles[agg["_es_nok"]] > 0.80).mean(),
+            })
     print(pd.DataFrame(resumen).to_string(index=False))
+    print("\n(Referencia azar: percentil_medio=0.50, pct_en_top20%=0.20)")
 
 
 def evaluate_synthetic(scores_dict, is_synthetic):
