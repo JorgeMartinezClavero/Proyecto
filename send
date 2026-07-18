@@ -167,7 +167,10 @@ def main():
           f"({len(nivel_cols)} fuegos detectados)")
 
     all_rows = []
-    for _, row in tqdm(ensayos.iterrows(), total=len(ensayos)):
+    n_empty = 0
+    n_error = 0
+    n_ok = 0
+    for i, (idx, row) in enumerate(tqdm(ensayos.iterrows(), total=len(ensayos))):
         fecha_inicio = pd.to_datetime(row["FechaInicio"])
         # Ya no restringimos a una ventana temprana: cogemos todo el rango
         # disponible del test (hasta FechaFin si ya acabo, o "ahora" si
@@ -175,15 +178,30 @@ def main():
         # comportamiento anomalo en general, así que maximizamos volumen.
         fecha_fin = pd.to_datetime(row["FechaFin"]) if pd.notna(row["FechaFin"]) else pd.Timestamp.now()
 
-        params = [str(row["SNR"]).zfill(10), str(row["FD"]).zfill(10), row["VIB"], row["TestName"],
+        snr_padded = str(row["SNR"]).zfill(10)
+        fd_padded = str(row["FD"]).zfill(10)
+        params = [snr_padded, fd_padded, row["VIB"], row["TestName"],
                    fecha_inicio, fecha_fin]
+
+        if i == 0:
+            print("\n===== DEBUG: primer test, para probar a mano en SSMS =====")
+            print(f"SNR original='{row['SNR']}' -> con zfill='{snr_padded}'")
+            print(f"FD original='{row['FD']}' -> con zfill='{fd_padded}'")
+            print(f"VIB='{row['VIB']}'  TestName='{row['TestName']}'")
+            print(f"fecha_inicio={fecha_inicio}  fecha_fin={fecha_fin}")
+            print("Query:", query)
+
         try:
             df = pd.read_sql(query, engine, params=params)
         except Exception as e:
-            print(f"  [WARN] fallo consultando SNR={row['SNR']} Test={row['TestName']}: {e}")
+            n_error += 1
+            if n_error <= 5:
+                print(f"  [WARN] fallo consultando SNR={row['SNR']} Test={row['TestName']}: {e}")
             continue
         if df.empty:
+            n_empty += 1
             continue
+        n_ok += 1
 
         df["var_canon"] = df["Variable_Name"].apply(canonical_name)
 
@@ -208,6 +226,9 @@ def main():
                     fila[f"{stat}__{r['var_canon']}"] = r[stat]
 
             all_rows.append(fila)
+
+    print(f"\nResumen consultas: {n_ok} con datos, {n_empty} vacias, {n_error} con error "
+          f"(de {len(ensayos)} tests)")
 
     dataset = pd.DataFrame(all_rows)
     print(f"\nDataset final: {dataset.shape[0]} filas (test x subciclo) "
