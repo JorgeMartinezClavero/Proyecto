@@ -1,27 +1,253 @@
--- Poblacion completa de tests IPR desde que la BBDD actual graba bien.
--- A diferencia de la extraccion anterior, AQUI NO filtramos por Estado ni
--- por Resultado: para entrenar el modelo de anomalias no necesitamos
--- etiqueta, y cuantos mas tests "normales" incluyamos (incluso en curso),
--- mejor aprende el modelo que es comportamiento tipico.
--- Resultado se conserva solo para la validacion cualitativa posterior
--- (comprobar si los pocos NOK reales conocidos puntuan como anomalos).
+"""
+Entrena varios modelos de deteccion de anomalias sobre filas
+(test, subciclo) y los compara de dos formas:
+  1) Cualitativa: ¿los pocos NOK_FUNC reales conocidos puntuan alto en
+     anomalia? (no da una metrica numerica robusta, pero es una
+     comprobacion de sentido comun).
+  2) Cuantitativa: inyectamos anomalias sinteticas (perturbamos variables
+     en copias de filas normales) y medimos recall/AUC-PR de verdad.
 
-SELECT
-    ID,
-    VIB,
-    FD,
-    SNR,
-    Ciclo AS TestName,
-    FechaInicio,
-    FechaFin,
-    Subciclo AS UltimoSubciclo,
-    Repeticion AS UltimaRepeticion,
-    Estado,
-    Resultado
-FROM QIT_DB.dbo.Ensayos
-WHERE Area = 'IPR'
-  AND (Eliminado IS NULL OR Eliminado = 0)
-  AND FechaInicio >= '2026-04-09'
-ORDER BY FechaInicio;
+Requiere:
+    pip install pandas numpy scikit-learn matplotlib
 
--- Exportar como ensayos_ipr_todos.csv (recuerda activar cabeceras al guardar)
+Uso:
+    python 05_train_anomaly_models.py
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.svm import OneClassSVM
+from sklearn.decomposition import PCA
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+DATA_PATH = "subciclos_features.parquet"
+CANDIDATOS_FIABLES_CSV = "candidatos_subciclo_alto.csv"  # de check_casos_fiables.py
+RANDOM_STATE = 42
+CONTAMINATION = 0.01     # tasa esperada de anomalias (ajusta si conoces mejor la real)
+N_SYNTHETIC = 200        # nº de anomalias sinteticas a inyectar para validar
+PERTURBATION_PCT = 0.30  # perturbacion del 30% sobre las variables numericas
+
+# One-Class SVM (kernel RBF) escala mal con muchas filas (cuadratico/cubico).
+# No hace falta GPU (ningun modelo aqui es deep learning), pero para no
+# tardar horas en un portatil, lo entrenamos sobre una submuestra y
+# despues puntuamos TODAS las filas igual -- no se pierde cobertura de
+# deteccion, solo se acota el coste de entrenamiento de este modelo en concreto.
+MAX_SAMPLES_OCSVM = 8000
+
+
+def load_data():
+    df = pd.read_parquet(DATA_PATH)
+
+    meta_cols = ["VIB", "SNR", "TestName", "Subcycle", "Repetition", "Resultado", "Estado"]
+    feature_cols = [c for c in df.columns if c not in meta_cols]
+
+    cat_cols = ["VIB"]
+    num_cols = [c for c in feature_cols if c not in cat_cols]
+
+    return df, feature_cols, cat_cols, num_cols
+
+
+def build_preprocessor(cat_cols, num_cols):
+    return ColumnTransformer([
+        ("num", Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]), num_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+    ])
+
+
+def inject_synthetic_anomalies(df, num_cols, n=N_SYNTHETIC, pct=PERTURBATION_PCT):
+    """
+    Copia n filas al azar y perturba sus variables numericas +/- pct%,
+    simulando un sensor que se desvia de lo esperado. Sirve como conjunto
+    de validacion cuantitativo dado que apenas hay NOK reales.
+    """
+    rng = np.random.RandomState(RANDOM_STATE)
+    sample = df.sample(n=min(n, len(df)), random_state=RANDOM_STATE).copy()
+
+    for col in num_cols:
+        if sample[col].notna().sum() == 0:
+            continue
+        signo = rng.choice([-1, 1], size=len(sample))
+        factor = 1 + signo * pct * rng.uniform(0.5, 1.5, size=len(sample))
+        sample[col] = sample[col] * factor
+
+    sample["_synthetic"] = 1
+    df = df.copy()
+    df["_synthetic"] = 0
+    return pd.concat([df, sample], ignore_index=True)
+
+
+def build_models(preprocessor):
+    return {
+        "IsolationForest": Pipeline([
+            ("prep", preprocessor),
+            ("model", IsolationForest(
+                contamination=CONTAMINATION, random_state=RANDOM_STATE, n_jobs=-1)),
+        ]),
+        "OneClassSVM": Pipeline([
+            ("prep", preprocessor),
+            ("model", OneClassSVM(nu=CONTAMINATION, kernel="rbf", gamma="scale")),
+        ]),
+        "LOF": Pipeline([
+            ("prep", preprocessor),
+            ("model", LocalOutlierFactor(
+                n_neighbors=35, contamination=CONTAMINATION, novelty=True)),
+        ]),
+    }
+
+
+def pca_reconstruction_scores(X_transformed, n_components=0.90):
+    """
+    'Autoencoder lineal': PCA reduce y reconstruye; el error de
+    reconstruccion hace de anomaly score. Evita depender de Keras/PyTorch
+    manteniendo la misma idea de fondo (aprender una representacion
+    comprimida de lo normal y medir cuanto se aleja cada caso de ella).
+    """
+    pca = PCA(n_components=n_components, random_state=RANDOM_STATE)
+    X_reduced = pca.fit_transform(X_transformed)
+    X_reconstructed = pca.inverse_transform(X_reduced)
+    error = np.mean((X_transformed - X_reconstructed) ** 2, axis=1)
+    return error, pca
+
+
+def evaluate_synthetic(scores_dict, is_synthetic):
+    results = []
+    for name, scores in scores_dict.items():
+        auc_roc = roc_auc_score(is_synthetic, scores)
+        auc_pr = average_precision_score(is_synthetic, scores)
+        results.append({"modelo": name, "auc_roc_sintetico": auc_roc,
+                         "auc_pr_sintetico": auc_pr})
+    return pd.DataFrame(results).sort_values("auc_pr_sintetico", ascending=False)
+
+
+def load_casos_fiables():
+    """
+    Casos NOK_FUNC/NOK_FUNC_EST considerados fiables: el criterio de
+    Estado (4,5) no sirvio para IPR (todos los NOK_FUNC quedaban en
+    estados intermedios tipo "Esperando Resolver Fallos"). En su lugar
+    usamos UltimoSubciclo > 10 como proxy de "el fallo se determino tras
+    suficiente operacion real, no un aborto administrativo temprano"
+    (ver check_casos_fiables.py). Devuelve el set de (SNR, VIB, TestName)
+    con datos reales y ese criterio cumplido.
+    """
+    try:
+        candidatos = pd.read_csv(CANDIDATOS_FIABLES_CSV)
+    except FileNotFoundError:
+        print(f"\n[AVISO] No se encontro {CANDIDATOS_FIABLES_CSV} -- corre antes "
+              "check_casos_fiables.py. El chequeo cualitativo se omite.")
+        return None
+    fiables = candidatos[candidatos["tiene_datos"] == True]
+    return set(zip(fiables["SNR"], fiables["VIB"], fiables["TestName"]))
+
+
+def qualitative_check(df, scores_dict):
+    """Percentil de anomalia en el que cae cada NOK_FUNC real conocido y fiable."""
+    df = df.copy()
+    for name, scores in scores_dict.items():
+        df[f"score_{name}"] = scores
+        df[f"percentil_{name}"] = pd.Series(scores).rank(pct=True).values
+
+    claves_fiables = load_casos_fiables()
+    if claves_fiables is None:
+        return
+
+    es_nok = df["Resultado"].astype(str).str.upper().isin(["NOK_FUNC", "NOK_FUNC_EST"])
+    es_fiable = df.apply(lambda r: (r["SNR"], r["VIB"], r["TestName"]) in claves_fiables, axis=1)
+    nok_mask = es_nok & es_fiable
+
+    if not nok_mask.any():
+        print("\n[AVISO] No hay casos NOK_FUNC fiables (UltimoSubciclo>10) en este "
+              "dataset -- el chequeo cualitativo no se puede hacer con datos reales.")
+        return
+    cols = ["SNR", "TestName", "Subcycle", "Resultado"] + \
+           [c for c in df.columns if c.startswith("percentil_")]
+    print(f"\n===== {nok_mask.sum()} CASOS NOK_FUNC FIABLES: percentil de anomalia por modelo =====")
+    print("(percentil cercano a 1.0 = de las mas anomalas del dataset)")
+    print(df.loc[nok_mask, cols].to_string(index=False))
+
+
+def fit_and_score(name, pipe, X_features):
+    """
+    Ajusta el preprocesador sobre TODAS las filas (para que el escalado sea
+    representativo), pero si el modelo es OneClassSVM y hay muchas filas,
+    entrena el modelo en si sobre una submuestra aleatoria -- y aun asi
+    puntua absolutamente todas las filas al final. Los demas modelos
+    (Isolation Forest, LOF, PCA) escalan bien y se entrenan con todo.
+    """
+    prep = pipe.named_steps["prep"]
+    model = pipe.named_steps["model"]
+
+    X_t = prep.fit_transform(X_features)
+
+    if name == "OneClassSVM" and X_t.shape[0] > MAX_SAMPLES_OCSVM:
+        rng = np.random.RandomState(RANDOM_STATE)
+        idx_muestra = rng.choice(X_t.shape[0], size=MAX_SAMPLES_OCSVM, replace=False)
+        print(f"  [{name}] entrenando sobre submuestra de {MAX_SAMPLES_OCSVM} "
+              f"de {X_t.shape[0]} filas (solo para acotar tiempo de entrenamiento)")
+        model.fit(X_t[idx_muestra])
+    else:
+        model.fit(X_t)
+
+    if hasattr(model, "score_samples"):
+        return -model.score_samples(X_t)  # mas alto = mas anomalo
+    return -model.decision_function(X_t)
+
+
+def main():
+    df, feature_cols, cat_cols, num_cols = load_data()
+    print(f"Dataset: {df.shape[0]} filas (test x subciclo)")
+    print(f"Casos con NOK_FUNC/NOK_FUNC_EST conocidos: "
+          f"{df['Resultado'].astype(str).str.upper().isin(['NOK_FUNC','NOK_FUNC_EST']).sum()}")
+
+    # --- Entrenamiento sobre datos reales (para el chequeo cualitativo) ---
+    preprocessor = build_preprocessor(cat_cols, num_cols)
+    models = build_models(preprocessor)
+
+    real_scores = {}
+    for name, pipe in models.items():
+        real_scores[name] = fit_and_score(name, pipe, df[feature_cols])
+
+    # PCA / autoencoder lineal
+    X_t_full = build_preprocessor(cat_cols, num_cols).fit_transform(df[feature_cols])
+    pca_scores, _ = pca_reconstruction_scores(X_t_full)
+    real_scores["PCA (autoencoder lineal)"] = pca_scores
+
+    qualitative_check(df, real_scores)
+
+    # --- Validacion cuantitativa con anomalias sinteticas ---
+    print("\nInyectando anomalias sinteticas para validacion cuantitativa...")
+    df_aug = inject_synthetic_anomalies(df, num_cols)
+
+    models2 = build_models(build_preprocessor(cat_cols, num_cols))
+    synth_scores = {}
+    for name, pipe in models2.items():
+        synth_scores[name] = fit_and_score(name, pipe, df_aug[feature_cols])
+
+    X_t_aug = build_preprocessor(cat_cols, num_cols).fit_transform(df_aug[feature_cols])
+    pca_scores_aug, _ = pca_reconstruction_scores(X_t_aug)
+    synth_scores["PCA (autoencoder lineal)"] = pca_scores_aug
+
+    resultados = evaluate_synthetic(synth_scores, df_aug["_synthetic"].values)
+    print("\n===== TABLA COMPARATIVA (validacion con anomalias sinteticas) =====")
+    print(resultados.to_string(index=False))
+    resultados.to_csv("comparacion_modelos_anomalias.csv", index=False)
+
+    # Guardar el dataset con scores reales para usarlo despues en la app
+    for name, scores in real_scores.items():
+        df[f"anomaly_score__{name}"] = scores
+    df.to_parquet("subciclos_con_scores.parquet", index=False)
+    print("\nGuardado subciclos_con_scores.parquet con los scores de cada modelo")
+
+
+if __name__ == "__main__":
+    main()
