@@ -1,321 +1,439 @@
 """
-Construye un dataset con una fila por (test, subciclo), en vez de una fila
-por test entero. Cada fila incluye:
-  - VIB (categoria, para que el modelo distinga familias/productos)
-  - nivel de cada fuego, obtenido de QIT_DB.QIT2_Subciclos.Nombre (via
-    QIT2_Ciclos_Subciclos/QIT2_Ciclos), parseado con el mismo regex que
-    ya usa app2.py -- NO se infiere de SbRep.Subcycle, que es solo un
-    indice de orden de ejecucion sin informacion de configuracion.
-  - estadisticos (mean/std/min/max) de las variables de potencia
-    (Measured_Power_*) para ese subciclo concreto.
+Entrena y compara modelos de deteccion de anomalias sobre filas
+(test, subciclo), con tres mejoras metodologicas respecto a la primera
+version:
 
-NOTA: ya no se restringe a una "ventana temprana" -- se usa toda la
-duracion disponible de cada test. El objetivo dejo de ser "alerta
-temprana" y paso a ser deteccion general de comportamiento anomalo, asi
-que maximizamos volumen de entrenamiento en vez de limitarlo.
+  1) Entrenamiento SEMI-SUPERVISADO: el conjunto de entrenamiento excluye
+     TODO lo etiquetado como fallo (fiable o no), para no contaminar la
+     definicion de "comportamiento normal" con posibles fallos reales.
+
+  2) Validacion OUT-OF-SAMPLE de verdad: se separa un holdout de datos
+     normales que el modelo NUNCA ve durante el entrenamiento. Tanto el
+     chequeo cualitativo (casos NOK reales) como el cuantitativo
+     (anomalias sinteticas) se evaluan sobre ese holdout + los casos NOK,
+     nunca sobre filas ya vistas en el entrenamiento.
+
+  3) Dos modelos nuevos en la comparativa:
+       - Gaussian Mixture Model (varias "sub-poblaciones" normales a la
+         vez, razonable dado que se mezclan ~50 VIBs distintos)
+       - Autoencoder no lineal real (MLPRegressor en configuracion de
+         cuello de botella, entrenado a reconstruirse a si mismo; el
+         error de reconstruccion es el anomaly score). Sin depender de
+         Keras/PyTorch, pero ya no es una aproximacion lineal como PCA.
 
 Requiere:
-    pip install pandas pyodbc sqlalchemy tqdm
+    pip install pandas numpy scikit-learn matplotlib
 
 Uso:
-    python 04_build_subcycle_dataset.py
-Salida:
-    subciclos_features.parquet
+    python 05_train_anomaly_models.py
 """
 
-import re
-import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine
-from tqdm import tqdm
+import pandas as pd
+import joblib
 
-# ============================== CONFIG ==============================
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.svm import OneClassSVM
+from sklearn.mixture import GaussianMixture
+from sklearn.neural_network import MLPRegressor
+from sklearn.decomposition import PCA
+from sklearn.metrics import roc_auc_score, average_precision_score
 
-# Servidor donde vive Measurement_all
-CONN_STR = (
-    "mssql+pyodbc://@TU_SERVIDOR/QIT_DATAMINING_20"
-    "?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
-)
+DATA_PATH = "subciclos_features.parquet"
+CANDIDATOS_FIABLES_CSV = "candidatos_subciclo_alto.csv"
 
-# Servidor donde vive QIT_DB (Ensayos, y tambien QIT2_Ciclos_Subciclos /
-# QIT2_Subciclos / QIT2_Ciclos, la definicion real de cada subciclo)
-CONN_STR_QITDB = (
-    "mssql+pyodbc://@TU_SERVIDOR_QITDB/QIT_DB"
-    "?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
-)
+RANDOM_STATE = 42
+CONTAMINATION = 0.01      # tasa esperada de anomalias (ajusta si conoces mejor la real)
+HOLDOUT_FRACTION = 0.20   # % de datos normales reservado para validar out-of-sample
+N_SYNTHETIC = 200         # nº de anomalias sinteticas a inyectar para validar
+PERTURBATION_PCT = 0.30   # perturbacion del 30% sobre las variables de potencia
 
-ENSAYOS_CSV = "ensayos_ipr_todos.csv"
+GMM_N_COMPONENTS = 8      # nº de "sub-poblaciones normales" a modelar
+AUTOENCODER_HIDDEN = (24, 8, 24)  # cuello de botella: 8 << nº de variables de entrada
 
-# Ya no filtramos variables desde Python: la query usa
-# VA.Variable_Name LIKE 'Measured_Power%' directamente en SQL, así cogemos
-# todas las variantes de fuego/modulo (F1, F2, PAN_F1, etc.) sin tener que
-# mantener una lista manual.
+# One-Class SVM (kernel RBF) escala mal con muchas filas. No hace falta
+# GPU (ningun modelo aqui es deep learning), pero para no tardar horas en
+# un portatil, se entrena sobre una submuestra si hay demasiadas filas.
+MAX_SAMPLES_OCSVM = 8000
 
-# Captura solo "F{n}" justo despues de "Measured_Power_", ignorando
-# cualquier sufijo posterior (modulo M70/M80, tecnologia MPX_3I/4I/5I,
-# etc.). Variables PAN ya se excluyen en la consulta SQL, no hace falta
-# contemplarlas aqui.
-VAR_PATTERN = re.compile(r"^Measured_Power_(F\d+)(?:_.*)?$")
-
-# Mismo regex que ya usa la app para extraer niveles de fuego del NOMBRE
-# del subciclo (campo QIT2_Subciclos.Nombre, no SbRep.Subcycle)
-SUBCYCLE_NAME_PATTERN = r"F(\d+)_N?([a-zA-Z0-9\[\]]+)"
-
-STATS = ["mean_val", "std_val", "min_val", "max_val"]
-
-OUTPUT_PATH = "subciclos_features.parquet"
-
-# ======================================================================
+MODELOS = ["IsolationForest", "OneClassSVM", "LOF", "GaussianMixture",
+           "PCA (autoencoder lineal)", "Autoencoder (MLP)"]
 
 
-def conversion_segura_int(val):
-    """Copiado de app2.py: algunos niveles no son puramente numericos."""
+def load_data():
+    df = pd.read_parquet(DATA_PATH)
+    meta_cols = ["SNR", "TestName", "Subcycle", "Repetition", "Resultado", "Estado"]
+    feature_cols = [c for c in df.columns if c not in meta_cols]
+    cat_cols = ["VIB"]
+    num_cols = [c for c in feature_cols if c not in cat_cols]
+    return df, feature_cols, cat_cols, num_cols
+
+
+def load_casos_fiables():
+    """
+    Casos NOK_FUNC/NOK_FUNC_EST considerados fiables: UltimoSubciclo > 10
+    (proxy de "el fallo se determino tras suficiente operacion real, no
+    un aborto administrativo temprano" -- ver check_casos_fiables.py).
+    Devuelve el set de (SNR, VIB, TestName) con datos reales y ese
+    criterio cumplido, o None si no se encuentra el fichero.
+    """
     try:
-        return int(float(val))
-    except (ValueError, TypeError):
-        return val
+        candidatos = pd.read_csv(
+            CANDIDATOS_FIABLES_CSV,
+            dtype={"SNR": str, "VIB": str, "TestName": str, "FD": str},
+        )
+    except FileNotFoundError:
+        print(f"\n[AVISO] No se encontro {CANDIDATOS_FIABLES_CSV} -- corre antes "
+              "check_casos_fiables.py. El chequeo cualitativo se omite.")
+        return None
+    fiables = candidatos[candidatos["tiene_datos"].astype(str).str.lower() == "true"]
+    return set(zip(fiables["SNR"], fiables["VIB"], fiables["TestName"]))
 
 
-# Codigos de nivel de fuego que aparecen y no encajan en el patron F{x} ni
-# en BA. Se van registrando aqui para poder revisarlos y ampliar el mapeo
-# si aparece algo mas aparte de BA.
-UNMAPPED_CODES = set()
+def build_preprocessor(cat_cols, num_cols):
+    return ColumnTransformer([
+        ("num", SimpleImputer(strategy="median"), num_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+    ])
 
 
-def parse_nivel_fuego(val):
+def _scale_numeric_part(X_fit_t, X_score_t, n_num):
+    """Escala solo la parte numerica (las columnas categoricas ya vienen
+    en 0/1 del one-hot, no hace falta escalarlas)."""
+    scaler = StandardScaler()
+    X_fit_num = scaler.fit_transform(X_fit_t[:, :n_num])
+    X_score_num = scaler.transform(X_score_t[:, :n_num])
+    X_fit_out = np.hstack([X_fit_num, X_fit_t[:, n_num:]])
+    X_score_out = np.hstack([X_score_num, X_score_t[:, n_num:]])
+    return X_fit_out, X_score_out
+
+
+def compute_scores(name, X_fit_raw, X_score_raw, cat_cols, num_cols):
     """
-    Convierte el codigo de nivel de fuego a un entero. El formato real
-    (confirmado con datos: SC_F1_N0_F2_N0_F3_N9_F4_N9_..._POWERVECTOR)
-    es un digito simple 0-9 tras la "N" (10 niveles reales), mas un
-    codigo especial BA (nivel "booster", por encima del maximo normal).
-    Cualquier otro codigo no reconocido se deja como NaN y se registra
-    en UNMAPPED_CODES para poder revisarlo.
+    Ajusta el modelo SOLO sobre X_fit_raw (datos normales de entrenamiento)
+    y devuelve el anomaly score (mas alto = mas anomalo) para cada fila de
+    X_score_raw. X_score_raw puede incluir filas nunca vistas en el ajuste.
     """
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return np.nan
+    prep = build_preprocessor(cat_cols, num_cols)
+    X_fit_t = prep.fit_transform(X_fit_raw)
+    X_score_t = prep.transform(X_score_raw)
+    X_fit_t, X_score_t = _scale_numeric_part(X_fit_t, X_score_t, len(num_cols))
 
-    val_str = str(val).strip().upper()
+    rng = np.random.RandomState(RANDOM_STATE)
 
-    if val_str == "BA":
-        return 10  # un nivel por encima del maximo normal (9)
+    if name == "IsolationForest":
+        model = IsolationForest(contamination=CONTAMINATION,
+                                 random_state=RANDOM_STATE, n_jobs=-1)
+        model.fit(X_fit_t)
+        return -model.score_samples(X_score_t)
 
-    if re.fullmatch(r"\d+", val_str):
-        return int(val_str)
+    if name == "OneClassSVM":
+        X_train = X_fit_t
+        if X_train.shape[0] > MAX_SAMPLES_OCSVM:
+            idx = rng.choice(X_train.shape[0], size=MAX_SAMPLES_OCSVM, replace=False)
+            X_train = X_train[idx]
+            print(f"  [OneClassSVM] entrenando sobre submuestra de "
+                  f"{MAX_SAMPLES_OCSVM} de {X_fit_t.shape[0]} filas")
+        model = OneClassSVM(nu=CONTAMINATION, kernel="rbf", gamma="scale")
+        model.fit(X_train)
+        return -model.decision_function(X_score_t)
 
-    UNMAPPED_CODES.add(val_str)
-    return np.nan
+    if name == "LOF":
+        model = LocalOutlierFactor(n_neighbors=35, contamination=CONTAMINATION,
+                                    novelty=True)
+        model.fit(X_fit_t)
+        return -model.score_samples(X_score_t)
+
+    if name == "GaussianMixture":
+        model = GaussianMixture(n_components=GMM_N_COMPONENTS,
+                                 covariance_type="diag", reg_covar=1e-3,
+                                 random_state=RANDOM_STATE)
+        model.fit(X_fit_t)
+        return -model.score_samples(X_score_t)
+
+    if name == "PCA (autoencoder lineal)":
+        pca = PCA(n_components=0.90, random_state=RANDOM_STATE)
+        pca.fit(X_fit_t)
+        X_rec = pca.inverse_transform(pca.transform(X_score_t))
+        return np.mean((X_score_t - X_rec) ** 2, axis=1)
+
+    if name == "Autoencoder (MLP)":
+        mlp = MLPRegressor(hidden_layer_sizes=AUTOENCODER_HIDDEN, max_iter=300,
+                            random_state=RANDOM_STATE, early_stopping=True)
+        mlp.fit(X_fit_t, X_fit_t)
+        X_rec = mlp.predict(X_score_t)
+        return np.mean((X_score_t - X_rec) ** 2, axis=1)
+
+    raise ValueError(f"Modelo desconocido: {name}")
 
 
-def fetch_subcycle_definitions(engine_qitdb, test_names):
+def inject_synthetic_anomalies(df, n=N_SYNTHETIC, pct=PERTURBATION_PCT):
     """
-    Trae, para el conjunto de TestName presentes en el dataset, la
-    definicion real de cada subciclo (Nombre) desde QIT_DB, y parsea los
-    niveles de fuego con el mismo regex que ya usa la app.
-    Se hace UNA vez para todos los tests (no por test), igual que en app2.py.
+    Copia n filas al azar (del holdout normal, NUNCA del entrenamiento) y
+    perturba SOLO sus variables de potencia medida +/- pct%, simulando un
+    sensor que se desvia de lo esperado. No se tocan nivel_F* (son la
+    configuracion comandada, no algo que un sensor pueda "fallar") ni VIB.
     """
-    tests_in_list = ", ".join(f"'{t}'" for t in test_names)
-    query_ciclos = f"""
-        SELECT c.[Nombre_Identificador_Ciclo] AS TestName,
-               cs.[OrdenEjecucion] AS Subcycle,
-               s.[Nombre]
-        FROM [QIT_DB].[dbo].[QIT2_Ciclos_Subciclos] cs
-        INNER JOIN [QIT_DB].[dbo].[QIT2_Subciclos] s
-            ON cs.[ID_Subiclo] = s.[ID_Subciclo]
-        INNER JOIN [QIT_DB].[dbo].[QIT2_Ciclos] c
-            ON c.ID_Ciclo = cs.ID_Ciclo
-        WHERE c.[Nombre_Identificador_Ciclo] IN ({tests_in_list})
+    cols_a_perturbar = [c for c in df.columns if "Measured_Power" in c]
+    rng = np.random.RandomState(RANDOM_STATE)
+    sample = df.sample(n=min(n, len(df)), random_state=RANDOM_STATE).copy()
+
+    for col in cols_a_perturbar:
+        if sample[col].notna().sum() == 0:
+            continue
+        signo = rng.choice([-1, 1], size=len(sample))
+        factor = 1 + signo * pct * rng.uniform(0.5, 1.5, size=len(sample))
+        sample[col] = sample[col] * factor
+
+    sample["_synthetic"] = 1
+    df = df.copy()
+    df["_synthetic"] = 0
+    return pd.concat([df, sample], ignore_index=True)
+
+
+def qualitative_check(df_eval, scores_dict, nok_mask):
     """
-    df_ciclos = pd.read_sql(query_ciclos, engine_qitdb)
-    df_ciclos["TestName"] = df_ciclos["TestName"].astype(str)
-    df_ciclos["Subcycle"] = df_ciclos["Subcycle"].astype(int)
+    Compara los TESTS NOK reales fiables contra los tests normales del
+    holdout, agregando el score de anomalia POR TEST (maximo y percentil
+    95 de sus subciclos) -- NO subciclo a subciclo.
 
-    patrones = df_ciclos["Nombre"].fillna("").str.extractall(SUBCYCLE_NAME_PATTERN)
-    if not patrones.empty:
-        df_niveles = patrones[1].unstack(level="match")
-        df_niveles.columns = [f"nivel_F{i+1}" for i in range(df_niveles.shape[1])]
-        for col in df_niveles.columns:
-            df_niveles[col] = df_niveles[col].apply(parse_nivel_fuego)
-        df_ciclos = df_ciclos.join(df_niveles)
-
-    return df_ciclos.rename(columns={"Nombre": "Subcycle_Name"})
-
-
-def build_query():
-    return """
-    SELECT
-        SbRep.Subcycle,
-        SbRep.Repetition,
-        VA.Variable_Name,
-        COUNT(*)                              AS n_points,
-        AVG(CAST(m.Measurement AS FLOAT))     AS mean_val,
-        STDEV(CAST(m.Measurement AS FLOAT))   AS std_val,
-        MIN(m.Measurement)                    AS min_val,
-        MAX(m.Measurement)                    AS max_val
-    FROM Measurement_all AS m
-    JOIN VA        ON m.ID_VA = VA.ID_VA
-    JOIN Sequence  AS seq ON m.ID_Sequence = seq.ID_Sequence
-    JOIN SbRep     ON seq.ID_SbRep = SbRep.ID_SbRep
-    JOIN TIP       ON SbRep.ID_TIP = TIP.ID_TIP
-    JOIN TPS       ON TPS.ID_TPS = TIP.ID_TPS
-    JOIN DUT       ON DUT.ID_DUT = TPS.ID_DUT
-    WHERE DUT.SNR = ?
-      AND DUT.FD = ?
-      AND DUT.VIB = ?
-      AND TIP.TestName = ?
-      AND seq.TimeStamp >= ?
-      AND seq.TimeStamp < ?
-      AND VA.Variable_Name LIKE 'Measured_Power%'
-      AND VA.Variable_Name NOT LIKE 'Measured_Power_PAN%'
-    GROUP BY SbRep.Subcycle, SbRep.Repetition, VA.Variable_Name
+    Esto es importante: un test etiquetado NOK puede haber fallado por el
+    comportamiento de un UNICO subciclo, no todos. Tratar cada subciclo de
+    un test NOK como "anomalo" por igual seria una etiqueta incorrecta
+    (la mayoria de sus subciclos probablemente sean perfectamente
+    normales). Al agregar por test, el subciclo que realmente disparo el
+    fallo domina el score final (via el maximo/percentil 95), sin
+    penalizar al modelo por el resto de subciclos normales de ese mismo
+    test.
     """
+    df_eval = df_eval.copy()
+    df_eval["_es_nok"] = nok_mask
+    for name, scores in scores_dict.items():
+        df_eval[f"score_{name}"] = scores
+
+    grp = df_eval.groupby(["SNR", "VIB", "TestName"])
+    score_cols = [f"score_{name}" for name in scores_dict]
+
+    agg_max = grp[score_cols].max()
+    agg_max.columns = [f"{c}__max" for c in agg_max.columns]
+    agg_p95 = grp[score_cols].quantile(0.95)
+    agg_p95.columns = [f"{c}__p95" for c in agg_p95.columns]
+    es_nok_test = grp["_es_nok"].max().astype(bool)
+
+    agg = pd.concat([agg_max, agg_p95, es_nok_test], axis=1).reset_index()
+
+    n_tests_nok = int(agg["_es_nok"].sum())
+    n_tests_total = len(agg)
+    print(f"\n===== Chequeo cualitativo A NIVEL DE TEST ({n_tests_nok} NOK de "
+          f"{n_tests_total} tests, agregando subciclos por maximo/percentil 95) =====")
+
+    if n_tests_nok == 0:
+        print("[AVISO] No hay tests NOK fiables en el conjunto de evaluacion.")
+        return
+
+    resumen = []
+    for name in scores_dict:
+        for agg_tipo in ["max", "p95"]:
+            col = f"score_{name}__{agg_tipo}"
+            percentiles = agg[col].rank(pct=True)
+            resumen.append({
+                "modelo": name,
+                "agregado": agg_tipo,
+                "percentil_medio_NOK": percentiles[agg["_es_nok"]].mean(),
+                "pct_NOK_en_top20%": (percentiles[agg["_es_nok"]] > 0.80).mean(),
+            })
+    print(pd.DataFrame(resumen).to_string(index=False))
+    print("\n(Referencia azar: percentil_medio=0.50, pct_en_top20%=0.20)")
 
 
-def canonical_name(var_name):
-    """Measured_Power_F3_MPX_3I_M80 -> Measured_Power_F3 (se colapsan
-    modulo y sufijo de tecnologia, se conserva el prefijo tal cual)"""
-    m = VAR_PATTERN.match(var_name)
-    if m:
-        return f"Measured_Power_{m.group(1)}"
-    return var_name
+def evaluate_synthetic(scores_dict, is_synthetic):
+    results = []
+    for name, scores in scores_dict.items():
+        auc_roc = roc_auc_score(is_synthetic, scores)
+        auc_pr = average_precision_score(is_synthetic, scores)
+        results.append({"modelo": name, "auc_roc_sintetico": auc_roc,
+                         "auc_pr_sintetico": auc_pr})
+    return pd.DataFrame(results).sort_values("auc_pr_sintetico", ascending=False)
 
 
-def coerce_nivel_columns(df, nivel_cols):
+def fit_final_oneclasssvm(X_fit_raw, cat_cols, num_cols):
     """
-    Las columnas nivel_F* pueden mezclar numeros y codigos especiales no
-    numericos (ej. 'BA'), porque conversion_segura_int() devuelve el valor
-    tal cual cuando no puede convertirlo a int. Una columna con tipos
-    mezclados rompe el guardado a parquet (pyarrow exige tipo consistente
-    por columna). Como estas columnas se usan como variables NUMERICAS en
-    el modelo de anomalias, forzamos a numerico y tratamos los codigos
-    especiales como dato no disponible (NaN) en vez de como texto.
+    Igual que la rama 'OneClassSVM' de compute_scores(), pero devolviendo
+    los objetos ya ajustados (preprocesador, scaler, modelo) en vez de
+    solo los scores, para poder guardarlos en disco y reutilizarlos
+    despues en la app sin tener que reentrenar nada.
     """
-    for col in nivel_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    prep = build_preprocessor(cat_cols, num_cols)
+    X_fit_t = prep.fit_transform(X_fit_raw)
+
+    scaler = StandardScaler()
+    n_num = len(num_cols)
+    X_fit_num = scaler.fit_transform(X_fit_t[:, :n_num])
+    X_fit_scaled = np.hstack([X_fit_num, X_fit_t[:, n_num:]])
+
+    rng = np.random.RandomState(RANDOM_STATE)
+    X_train = X_fit_scaled
+    if X_train.shape[0] > MAX_SAMPLES_OCSVM:
+        idx = rng.choice(X_train.shape[0], size=MAX_SAMPLES_OCSVM, replace=False)
+        X_train = X_train[idx]
+
+    model = OneClassSVM(nu=CONTAMINATION, kernel="rbf", gamma="scale")
+    model.fit(X_train)
+
+    return prep, scaler, model
 
 
 def main():
-    ensayos = pd.read_csv(ENSAYOS_CSV, sep=';', dtype={"FD": str, "SNR": str, "VIB": str, "TestName": str})
-    print(f"Tests a procesar: {len(ensayos)}")
+    df, feature_cols, cat_cols, num_cols = load_data()
+    print(f"Dataset: {df.shape[0]} filas (test x subciclo)")
 
-    engine = create_engine(CONN_STR)
-    engine_qitdb = create_engine(CONN_STR_QITDB)
-    query = build_query()
+    claves_fiables = load_casos_fiables()
+    es_nok = df["Resultado"].astype(str).str.upper().isin(["NOK_FUNC", "NOK_FUNC_EST"])
+    if claves_fiables is not None:
+        es_fiable = df.apply(
+            lambda r: (r["SNR"], r["VIB"], r["TestName"]) in claves_fiables, axis=1
+        )
+    else:
+        es_fiable = pd.Series(False, index=df.index)
+    df["_nok_fiable"] = es_nok & es_fiable
+    print(f"Casos NOK reales fiables: {df['_nok_fiable'].sum()} filas, "
+          f"{df.loc[df['_nok_fiable'], ['SNR','VIB','TestName']].drop_duplicates().shape[0]} tests")
 
-    # Descartamos filas con SNR/FD/VIB/TestName vacios: no se pueden
-    # consultar (pyodbc no acepta NaN donde espera texto) y solo hacen
-    # perder tiempo con errores.
-    n_antes = len(ensayos)
-    ensayos = ensayos.dropna(subset=["SNR", "FD", "VIB", "TestName"])
-    if len(ensayos) < n_antes:
-        print(f"Descartados {n_antes - len(ensayos)} tests con SNR/FD/VIB/TestName vacio")
+    # --- 1) Entrenamiento SOLO con datos normales (excluye TODO lo NOK,
+    # fiable o no, para no contaminar la definicion de "normal") ---
+    df_ok = df[df["Resultado"].astype(str).str.upper() == "OK"].reset_index(drop=True)
 
-    # Definicion de subciclos (niveles de fuego), UNA sola vez para todos
-    # los TestName presentes, igual que hace app2.py
-    test_names = ensayos["TestName"].unique().tolist()
-    df_subciclos_def = fetch_subcycle_definitions(engine_qitdb, test_names)
-    nivel_cols = [c for c in df_subciclos_def.columns if c.startswith("nivel_F")]
-    print(f"Definiciones de subciclo cargadas: {len(df_subciclos_def)} "
-          f"({len(nivel_cols)} fuegos detectados)")
-    if UNMAPPED_CODES:
-        print(f"[AVISO] Codigos de nivel no reconocidos (quedan como NaN): "
-              f"{sorted(UNMAPPED_CODES)} -- si son validos, hay que ampliar "
-              f"el mapeo en parse_nivel_fuego()")
+    # --- 2) Split train/holdout dentro de lo normal, para validar
+    # out-of-sample de verdad ---
+    rng = np.random.RandomState(RANDOM_STATE)
+    idx = rng.permutation(len(df_ok))
+    n_holdout = int(len(df_ok) * HOLDOUT_FRACTION)
+    df_holdout_normal = df_ok.iloc[idx[:n_holdout]].reset_index(drop=True)
+    df_train = df_ok.iloc[idx[n_holdout:]].reset_index(drop=True)
 
-    all_rows = []
-    n_empty = 0
-    n_error = 0
-    n_ok = 0
-    for i, (idx, row) in enumerate(tqdm(ensayos.iterrows(), total=len(ensayos))):
-        fecha_inicio = pd.to_datetime(row["FechaInicio"])
-        # Ya no restringimos a una ventana temprana: cogemos todo el rango
-        # disponible del test (hasta FechaFin si ya acabo, o "ahora" si
-        # sigue en curso). Ya no buscamos alerta temprana, solo detectar
-        # comportamiento anomalo en general, así que maximizamos volumen.
-        fecha_fin_raw = pd.to_datetime(row["FechaFin"]) if pd.notna(row["FechaFin"]) else None
-        # Si FechaFin es un valor placeholder/centinela (ej. 1904-01-01,
-        # tipico de SQL Server para "sin fecha real") o es anterior al
-        # inicio, tratamos el test como si siguiera en curso.
-        if fecha_fin_raw is None or fecha_fin_raw <= fecha_inicio:
-            fecha_fin = pd.Timestamp.now()
-        else:
-            fecha_fin = fecha_fin_raw
+    df_nok_fiable = df[df["_nok_fiable"]].reset_index(drop=True)
 
-        snr_padded = str(row["SNR"]).zfill(10)
-        fd_padded = str(row["FD"]).zfill(10)
-        # OJO: params debe ser una TUPLA, no una lista -- pandas interpreta
-        # una lista como "varias filas de parametros" y falla con
-        # "List argument must consist only of tuples or dictionaries".
-        params = (snr_padded, fd_padded, row["VIB"], row["TestName"],
-                  fecha_inicio, fecha_fin)
+    print(f"Entrenamiento (solo normal, {1-HOLDOUT_FRACTION:.0%}): {len(df_train)} filas")
+    print(f"Holdout normal (no visto en entrenamiento): {len(df_holdout_normal)} filas")
 
-        if i == 0:
-            print("\n===== DEBUG: primer test, para probar a mano en SSMS =====")
-            print(f"SNR original='{row['SNR']}' -> con zfill='{snr_padded}'")
-            print(f"FD original='{row['FD']}' -> con zfill='{fd_padded}'")
-            print(f"VIB='{row['VIB']}'  TestName='{row['TestName']}'")
-            print(f"fecha_inicio={fecha_inicio}  fecha_fin={fecha_fin}")
-            print("Query:", query)
+    # --- Chequeo cualitativo: holdout normal + NOK reales, ambos
+    # out-of-sample (el modelo se entreno solo con df_train) ---
+    df_eval_qual = pd.concat([df_holdout_normal, df_nok_fiable], ignore_index=True)
+    nok_mask_qual = np.zeros(len(df_eval_qual), dtype=bool)
+    nok_mask_qual[len(df_holdout_normal):] = True
 
-        try:
-            df = pd.read_sql(query, engine, params=params)
-        except Exception as e:
-            n_error += 1
-            if n_error <= 5:
-                print(f"  [WARN] fallo consultando SNR={row['SNR']} Test={row['TestName']}: {e}")
-            continue
-        if df.empty:
-            n_empty += 1
-            continue
-        n_ok += 1
+    scores_qual = {}
+    for name in MODELOS:
+        print(f"Entrenando {name} (chequeo cualitativo)...")
+        scores_qual[name] = compute_scores(
+            name, df_train[feature_cols], df_eval_qual[feature_cols], cat_cols, num_cols
+        )
+    qualitative_check(df_eval_qual, scores_qual, nok_mask_qual)
 
-        df["var_canon"] = df["Variable_Name"].apply(canonical_name)
+    # --- 3) Validacion cuantitativa con sinteticas, out-of-sample de
+    # verdad: se perturban SOLO filas del holdout, nunca del entrenamiento ---
+    print("\nInyectando anomalias sinteticas sobre el holdout (out-of-sample)...")
+    df_holdout_aug = inject_synthetic_anomalies(df_holdout_normal)
 
-        # niveles de fuego de este TestName (misma definicion para todas
-        # las unidades que corren ese ciclo)
-        niveles_test = df_subciclos_def[df_subciclos_def["TestName"] == row["TestName"]]
+    scores_synth = {}
+    for name in MODELOS:
+        print(f"Entrenando {name} (validacion sintetica)...")
+        scores_synth[name] = compute_scores(
+            name, df_train[feature_cols], df_holdout_aug[feature_cols], cat_cols, num_cols
+        )
 
-        for (subciclo, repeticion), grupo in df.groupby(["Subcycle", "Repetition"]):
-            fila_niveles = niveles_test[niveles_test["Subcycle"] == subciclo]
-            fila = {col: (fila_niveles.iloc[0][col] if not fila_niveles.empty else np.nan)
-                    for col in nivel_cols}
+    resultados = evaluate_synthetic(scores_synth, df_holdout_aug["_synthetic"].values)
+    print("\n===== TABLA COMPARATIVA (validacion con anomalias sinteticas, out-of-sample) =====")
+    print(resultados.to_string(index=False))
+    resultados.to_csv("comparacion_modelos_anomalias.csv", index=False)
 
-            fila["VIB"] = row["VIB"]
-            fila["SNR"] = row["SNR"]
-            fila["TestName"] = row["TestName"]
-            fila["Subcycle"] = subciclo
-            fila["Repetition"] = repeticion
-            fila["Resultado"] = row["Resultado"]
-            fila["Estado"] = row.get("Estado", np.nan)
+    # --- Puntuar TODO el dataset para la app/graficas, reentrenando sobre
+    # TODOS los datos normales disponibles (train+holdout) para
+    # aprovechar el maximo de datos en el modelo final ---
+    print("\nEntrenando modelos finales sobre todo lo normal, puntuando dataset completo...")
+    for name in MODELOS:
+        df[f"anomaly_score__{name}"] = compute_scores(
+            name, df_ok[feature_cols], df[feature_cols], cat_cols, num_cols
+        )
 
-            for _, r in grupo.iterrows():
-                for stat in STATS:
-                    fila[f"{stat}__{r['var_canon']}"] = r[stat]
+    df.to_parquet("subciclos_con_scores.parquet", index=False)
+    print("\nGuardado subciclos_con_scores.parquet con los scores de cada modelo")
 
-            all_rows.append(fila)
+    # --- Definicion operativa de "anomalia": percentil respecto a la
+    # distribucion de scores de los tests NORMALES conocidos (no el
+    # mecanismo interno de cada modelo, que no es consistente entre
+    # ellos: IsolationForest/LOF usan score_samples() directamente, donde
+    # 'contamination' no tiene ningun efecto; solo OneClassSVM usa 'nu' de
+    # forma que si afecta a la frontera aprendida; GMM/PCA/autoencoder no
+    # tienen ningun concepto de contaminacion). El umbral de alerta
+    # (percentil 80) viene de la validacion cualitativa: con
+    # OneClassSVM/p95 capturaba mas de la mitad de los NOK reales
+    # revisando solo el 20% mas anomalo.
+    UMBRAL_ALERTA = 0.80
+    es_ok_mask = df["Resultado"].astype(str).str.upper() == "OK"
+    referencias = {}
+    for name in MODELOS:
+        # la distribucion de referencia es la de los propios tests
+        # normales ya puntuados arriba -- no hace falta reentrenar nada mas
+        referencia = np.sort(df.loc[es_ok_mask, f"anomaly_score__{name}"].values)
+        referencias[name] = referencia
+        percentil = np.searchsorted(referencia, df[f"anomaly_score__{name}"]) / len(referencia)
+        df[f"percentil__{name}"] = percentil
+        df[f"alerta__{name}"] = percentil > UMBRAL_ALERTA
 
-        # Guardado incremental cada 100 tests: si el proceso se corta a
-        # mitad (se cae la conexion, se cierra el portatil...), no se
-        # pierden los ~50 minutos enteros -- se puede retomar desde el
-        # ultimo parcial guardado. Envuelto en try/except para que un
-        # fallo de guardado no tire el resto del proceso en curso.
-        if (i + 1) % 100 == 0 and all_rows:
-            try:
-                df_parcial = pd.DataFrame(all_rows)
-                coerce_nivel_columns(df_parcial, nivel_cols)
-                df_parcial.to_parquet(OUTPUT_PATH + ".parcial", index=False)
-            except Exception as e:
-                print(f"  [WARN] no se pudo guardar el parcial en el test {i+1}: {e}")
+    df.to_parquet("subciclos_con_scores.parquet", index=False)
+    np.savez("referencia_scores_normal.npz", **referencias)
+    print(f"Definicion de alerta: percentil > {UMBRAL_ALERTA} respecto a tests normales.")
+    print("Guardado referencia_scores_normal.npz -- distribucion de referencia fija "
+          "para calcular el percentil de tests nuevos en la app (no recalcular contra "
+          "un grupo que cambie cada vez, o el mismo test cambiaria de percentil sin "
+          "haber cambiado el).")
 
-    print(f"\nResumen consultas: {n_ok} con datos, {n_empty} vacias, {n_error} con error "
-          f"(de {len(ensayos)} tests)")
+    # --- Persistir el modelo FINAL elegido (One-Class SVM, agregacion
+    # por maximo) para poder usarlo en la app sin reentrenar nada ---
+    print("\nEntrenando y guardando el modelo final (One-Class SVM) para la app...")
+    prep_final, scaler_final, model_final = fit_final_oneclasssvm(
+        df_ok[feature_cols], cat_cols, num_cols
+    )
+    joblib.dump({
+        "preprocessor": prep_final,
+        "scaler": scaler_final,
+        "model": model_final,
+        "cat_cols": cat_cols,
+        "num_cols": num_cols,
+        "feature_cols": feature_cols,
+        "referencia_scores": referencias["OneClassSVM"],
+        "umbral_alerta": UMBRAL_ALERTA,
+    }, "modelo_final_oneclasssvm.joblib")
+    print("Guardado modelo_final_oneclasssvm.joblib -- listo para usar en la app "
+          "sin reentrenar (incluye preprocesador, scaler, modelo, columnas "
+          "esperadas y distribucion de referencia).")
 
-    dataset = pd.DataFrame(all_rows)
-    coerce_nivel_columns(dataset, nivel_cols)
-    print(f"\nDataset final: {dataset.shape[0]} filas (test x subciclo) "
-          f"x {dataset.shape[1]} columnas")
-    dataset.to_parquet(OUTPUT_PATH, index=False)
-    print(f"Guardado en {OUTPUT_PATH}")
+    # --- Anomalias sinteticas puntuadas por el modelo FINAL (entrenado
+    # con todos los datos normales), para poder compararlas como una
+    # tercera categoria junto a "Resto" y "NOK real" en las graficas.
+    # Cada sintetica recibe un SNR/TestName UNICO: asi, cuando las
+    # graficas agreguen por (SNR,VIB,TestName), cada una forma su propio
+    # grupo de una sola fila y su valor agregado (max/p95) es
+    # simplemente su propio score, sin distorsion.
+    print("\nGenerando anomalias sinteticas puntuadas por el modelo final...")
+    df_sint_aug = inject_synthetic_anomalies(df_ok)
+    df_sint = df_sint_aug[df_sint_aug["_synthetic"] == 1].reset_index(drop=True)
+    df_sint["SNR"] = [f"SINT_{i}" for i in range(len(df_sint))]
+    df_sint["TestName"] = [f"SINT_TEST_{i}" for i in range(len(df_sint))]
+    df_sint["Resultado"] = "NOK_SINTETICO"
+
+    for name in MODELOS:
+        df_sint[f"anomaly_score__{name}"] = compute_scores(
+            name, df_ok[feature_cols], df_sint[feature_cols], cat_cols, num_cols
+        )
+
+    df_sint.to_parquet("sinteticos_con_scores.parquet", index=False)
+    print("Guardado sinteticos_con_scores.parquet")
 
 
 if __name__ == "__main__":
