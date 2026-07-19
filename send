@@ -59,6 +59,12 @@ def main():
         if build_ds.UNMAPPED_CODES:
             print("\nCodigos no reconocidos (fuera de F{x} y BA):", sorted(build_ds.UNMAPPED_CODES))
 
+        print("\n===== Valores reales (con repr, para ver caracteres ocultos) "
+              "y su conversion, uno a uno =====")
+        muestra = patrones[1].dropna().unique()[:25]
+        for val in muestra:
+            print(f"  repr={repr(val):20s} -> parse_nivel_fuego = {build_ds.parse_nivel_fuego(val)}")
+
 
 if __name__ == "__main__":
     main()
