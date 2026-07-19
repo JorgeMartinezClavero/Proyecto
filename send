@@ -38,7 +38,12 @@ def resumen_general(df):
     nivel_cols = [c for c in df.columns if c.startswith("nivel_F")]
 
     print("\n===== Resumen general =====")
-    print(f"Tests distintos (SNR): {df['SNR'].nunique()}")
+    n_tipos_test = df["TestName"].nunique()
+    n_ejecuciones = df[["SNR", "VIB", "TestName"]].drop_duplicates().shape[0]
+    print(f"Tipos de test distintos (TestName): {n_tipos_test}")
+    print(f"Ejecuciones de test (combinación SNR+VIB+TestName): {n_ejecuciones}")
+    print(f"SNR distintos (unidades físicas, ojo: una misma SNR podría "
+          f"aparecer en más de una ejecución): {df['SNR'].nunique()}")
     print(f"Modelos de producto distintos (VIB): {df['VIB'].nunique()}")
     print(f"Variables de potencia: {len(power_cols)}  |  Niveles de fuego: {len(nivel_cols)}")
 
