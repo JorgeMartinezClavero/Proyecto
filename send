@@ -1,161 +1,63 @@
 """
-Analisis exploratorio de datos (EDA) sobre el conjunto de datos ya
-construido (subciclos_features.parquet), antes de entrenar los modelos
-de anomalias. Pensado para dar contenido a la memoria: distribucion de
-variables, balance de clases, relacion entre nivel de fuego comandado y
-potencia medida, y correlacion entre variables.
+Diagnostico rapido: mira que esta capturando de verdad el regex de
+niveles de fuego ANTES de convertirlo a numero, para ver por que solo
+sale el valor 19 (BA).
 
-Requiere:
-    pip install pandas numpy matplotlib
+Reutiliza las funciones de 04_build_subcycle_dataset.py (ajusta el
+nombre del fichero si lo llamaste distinto).
 
 Uso:
-    python 08_eda.py
-Salida (en la carpeta actual):
-    eda_resumen.csv
-    eda1_balance_clases.png
-    eda2_distribucion_vib.png
-    eda3_missing_por_variable.png
-    eda4_distribucion_niveles_fuego.png
-    eda5_correlacion_potencias.png
-    eda6_nivel_vs_potencia.png
+    python diagnostico_niveles.py
 """
 
+import importlib.util
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
 
-DATA_PATH = "subciclos_features.parquet"
+spec = importlib.util.spec_from_file_location("build_ds", "04_build_subcycle_dataset.py")
+build_ds = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_ds)
 
-
-def cargar():
-    df = pd.read_parquet(DATA_PATH)
-    print(f"Dataset: {df.shape[0]} filas x {df.shape[1]} columnas")
-    return df
-
-
-def resumen_general(df):
-    power_cols = [c for c in df.columns if c.startswith("mean_val__Measured_Power")]
-    nivel_cols = [c for c in df.columns if c.startswith("nivel_F")]
-
-    print("\n===== Resumen general =====")
-    n_tipos_test = df["TestName"].nunique()
-    n_ejecuciones = df[["SNR", "VIB", "TestName"]].drop_duplicates().shape[0]
-    print(f"Tipos de test distintos (TestName): {n_tipos_test}")
-    print(f"Ejecuciones de test (combinación SNR+VIB+TestName): {n_ejecuciones}")
-    print(f"SNR distintos (unidades físicas, ojo: una misma SNR podría "
-          f"aparecer en más de una ejecución): {df['SNR'].nunique()}")
-    print(f"Modelos de producto distintos (VIB): {df['VIB'].nunique()}")
-    print(f"Variables de potencia: {len(power_cols)}  |  Niveles de fuego: {len(nivel_cols)}")
-
-    resumen = df[power_cols + nivel_cols].describe().T
-    resumen["pct_missing"] = df[power_cols + nivel_cols].isna().mean() * 100
-    resumen.to_csv("eda_resumen.csv")
-    print("\nGuardado eda_resumen.csv (estadisticos descriptivos + % de NaN por variable)")
-    return power_cols, nivel_cols
-
-
-def eda1_balance_clases(df):
-    counts = df["Resultado"].astype(str).str.upper().value_counts()
-    fig, ax = plt.subplots(figsize=(6, 4.5))
-    counts.plot(kind="bar", ax=ax, color="#4C72B0", edgecolor="black")
-    ax.set_ylabel("nº de filas (test x subciclo)")
-    ax.set_title("Balance de clases por Resultado")
-    for i, v in enumerate(counts.values):
-        ax.text(i, v, f"{v}\n({v/counts.sum()*100:.1f}%)", ha="center", va="bottom", fontsize=9)
-    fig.tight_layout()
-    fig.savefig("eda1_balance_clases.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda1_balance_clases.png")
-
-
-def eda2_distribucion_vib(df, top_n=15):
-    counts = df["VIB"].value_counts().head(top_n)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    counts.plot(kind="barh", ax=ax, color="#55A868", edgecolor="black")
-    ax.invert_yaxis()
-    ax.set_xlabel("nº de filas (test x subciclo)")
-    ax.set_title(f"Top {top_n} modelos de producto (VIB) con más datos")
-    fig.tight_layout()
-    fig.savefig("eda2_distribucion_vib.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda2_distribucion_vib.png")
-
-
-def eda3_missing_por_variable(df, power_cols):
-    pct_missing = df[power_cols].isna().mean().sort_values(ascending=True) * 100
-    fig, ax = plt.subplots(figsize=(7, 5))
-    pct_missing.plot(kind="barh", ax=ax, color="#C44E52", edgecolor="black")
-    ax.set_xlabel("% de filas con dato ausente")
-    ax.set_title("Ausencia de datos por variable de potencia\n(estructural: no todos los modelos tienen todos los fuegos)")
-    fig.tight_layout()
-    fig.savefig("eda3_missing_por_variable.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda3_missing_por_variable.png")
-
-
-def eda4_distribucion_niveles(df, nivel_cols):
-    fig, axes = plt.subplots(1, len(nivel_cols), figsize=(3.2 * len(nivel_cols), 4), sharey=True)
-    if len(nivel_cols) == 1:
-        axes = [axes]
-    for ax, col in zip(axes, nivel_cols):
-        df[col].dropna().plot(kind="hist", bins=19, ax=ax, color="#8172B2", edgecolor="black")
-        ax.set_title(col)
-        ax.set_xlabel("nivel comandado")
-    fig.suptitle("Distribución de niveles de fuego comandados por posición")
-    fig.tight_layout()
-    fig.savefig("eda4_distribucion_niveles_fuego.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda4_distribucion_niveles_fuego.png")
-
-
-def eda5_correlacion(df, power_cols):
-    corr = df[power_cols].corr()
-    fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1)
-    ax.set_xticks(range(len(power_cols)))
-    ax.set_xticklabels([c.replace("mean_val__Measured_Power_", "") for c in power_cols], rotation=45, ha="right")
-    ax.set_yticks(range(len(power_cols)))
-    ax.set_yticklabels([c.replace("mean_val__Measured_Power_", "") for c in power_cols])
-    for i in range(len(power_cols)):
-        for j in range(len(power_cols)):
-            ax.text(j, i, f"{corr.iloc[i,j]:.2f}", ha="center", va="center", fontsize=8)
-    fig.colorbar(im, ax=ax, label="correlación")
-    ax.set_title("Correlación entre variables de potencia media por fuego")
-    fig.tight_layout()
-    fig.savefig("eda5_correlacion_potencias.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda5_correlacion_potencias.png")
-
-
-def eda6_nivel_vs_potencia(df):
-    """Comprobacion de sentido fisico: a mayor nivel comandado, deberia
-    observarse mayor potencia medida en ese mismo fuego."""
-    pares = [(f"nivel_F{i}", f"mean_val__Measured_Power_F{i}") for i in range(1, 6)]
-    pares_validos = [(n, p) for n, p in pares if n in df.columns and p in df.columns]
-
-    fig, axes = plt.subplots(1, len(pares_validos), figsize=(3.5 * len(pares_validos), 4.2), sharey=False)
-    if len(pares_validos) == 1:
-        axes = [axes]
-    for ax, (nivel_col, power_col) in zip(axes, pares_validos):
-        sub = df[[nivel_col, power_col]].dropna()
-        if sub.empty:
-            continue
-        sub.boxplot(column=power_col, by=nivel_col, ax=ax, grid=False)
-        ax.set_title(f"F{nivel_col[-1]}", fontsize=10)
-        ax.set_xlabel("nivel comandado")
-        ax.set_ylabel("potencia media medida")
-    fig.suptitle("Relación entre nivel de fuego comandado y potencia medida")
-    plt.suptitle("Relación entre nivel de fuego comandado y potencia medida")
-    fig.tight_layout()
-    fig.savefig("eda6_nivel_vs_potencia.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda6_nivel_vs_potencia.png")
+ENSAYOS_CSV = "ensayos_ipr_todos.csv"
 
 
 def main():
-    df = cargar()
-    power_cols, nivel_cols = resumen_general(df)
-    eda1_balance_clases(df)
-    eda2_distribucion_vib(df)
-    eda3_missing_por_variable(df, power_cols)
-    eda4_distribucion_niveles(df, nivel_cols)
-    eda5_correlacion(df, power_cols)
-    eda6_nivel_vs_potencia(df)
-    print("\nEDA completo.")
+    ensayos = pd.read_csv(ENSAYOS_CSV, sep=';',
+                           dtype={"FD": str, "SNR": str, "VIB": str, "TestName": str})
+    test_names = ensayos["TestName"].dropna().unique().tolist()
+
+    engine_qitdb = build_ds.create_engine(build_ds.CONN_STR_QITDB)
+
+    query_ciclos = f"""
+        SELECT c.[Nombre_Identificador_Ciclo] AS TestName,
+               cs.[OrdenEjecucion] AS Subcycle,
+               s.[Nombre]
+        FROM [QIT_DB].[dbo].[QIT2_Ciclos_Subciclos] cs
+        INNER JOIN [QIT_DB].[dbo].[QIT2_Subciclos] s
+            ON cs.[ID_Subiclo] = s.[ID_Subciclo]
+        INNER JOIN [QIT_DB].[dbo].[QIT2_Ciclos] c
+            ON c.ID_Ciclo = cs.ID_Ciclo
+        WHERE c.[Nombre_Identificador_Ciclo] IN ({', '.join(repr(t) for t in test_names)})
+    """
+    df_ciclos = pd.read_sql(query_ciclos, engine_qitdb)
+
+    print(f"Definiciones de subciclo cargadas: {len(df_ciclos)}")
+    print("\n===== Ejemplos de nombres de subciclo tal cual vienen de la BBDD =====")
+    print(df_ciclos["Nombre"].dropna().drop_duplicates().head(20).to_string(index=False))
+
+    print("\n===== Todo lo que el regex SUBCYCLE_NAME_PATTERN captura como 'nivel' (antes de convertir) =====")
+    patrones = df_ciclos["Nombre"].fillna("").str.extractall(build_ds.SUBCYCLE_NAME_PATTERN)
+    if patrones.empty:
+        print("[AVISO] El regex no ha encontrado NINGUNA coincidencia -- revisar formato real del nombre.")
+    else:
+        print("Valores capturados en el grupo 'nivel' (columna 1), con su frecuencia:")
+        print(patrones[1].value_counts().head(30))
+
+    print("\n===== Como quedan tras aplicar parse_nivel_fuego =====")
+    if not patrones.empty:
+        convertidos = patrones[1].apply(build_ds.parse_nivel_fuego)
+        print(convertidos.value_counts(dropna=False).head(30))
+        if build_ds.UNMAPPED_CODES:
+            print("\nCodigos no reconocidos (fuera de F{x} y BA):", sorted(build_ds.UNMAPPED_CODES))
 
 
 if __name__ == "__main__":
