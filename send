@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 import joblib
 import streamlit as st
+import matplotlib.pyplot as plt
 from sqlalchemy import create_engine
 
 # --- Reutilizamos la logica ya validada de 04_build_subcycle_dataset.py,
@@ -78,6 +79,17 @@ def opciones_snr(_engine_qitdb, vib, test_name):
     return pd.read_sql(q, _engine_qitdb, dtype={"SNR": str, "FD": str})
 
 
+@st.cache_data(ttl=300)
+def opciones_ultimos_tests(_engine_qitdb, n=30):
+    q = f"""
+        SELECT TOP {n} VIB, Ciclo AS TestName, SNR, FD, FechaInicio, FechaFin, Resultado
+        FROM QIT_DB.dbo.Ensayos
+        WHERE Area='IPR'
+        ORDER BY FechaInicio DESC
+    """
+    return pd.read_sql(q, _engine_qitdb, dtype={"SNR": str, "FD": str})
+
+
 def construir_features_test(engine, engine_qitdb, snr, fd, vib, test_name, fecha_inicio, fecha_fin):
     """Reconstruye, para UN ensayo, exactamente el mismo dataframe de
     features por subciclo que 04_build_subcycle_dataset.py genera para
@@ -86,8 +98,8 @@ def construir_features_test(engine, engine_qitdb, snr, fd, vib, test_name, fecha
     query = build_ds.build_query()
     fecha_fin_efectiva = fecha_fin if pd.notna(fecha_fin) else pd.Timestamp.now()
 
-    params = [str(snr).zfill(10), str(fd).zfill(10), vib, test_name,
-              pd.to_datetime(fecha_inicio), pd.to_datetime(fecha_fin_efectiva)]
+    params = (str(snr).zfill(10), str(fd).zfill(10), vib, test_name,
+              pd.to_datetime(fecha_inicio), pd.to_datetime(fecha_fin_efectiva))
     df = pd.read_sql(query, engine, params=params)
     if df.empty:
         return None
@@ -149,34 +161,83 @@ def color_semaforo(percentil):
         return "🔴", "Alerta"
 
 
+def graficar_evolucion_subciclos(features_df):
+    """Grafica el percentil de anomalia a lo largo del ensayo (ordenado
+    por repeticion y subciclo), coloreando los puntos segun el semaforo
+    -- version simplificada, para un unico ensayo, de la Figura 4 de la
+    memoria (evolucion del score por subciclo)."""
+    datos = features_df.sort_values(["Repetition", "Subcycle"]).reset_index(drop=True)
+    x = range(len(datos))
+    colores = {
+        "Normal": "#55A868",
+        "Atención": "#DDB13A",
+        "Alerta": "#C44E52",
+    }
+    etiquetas = [color_semaforo(p)[1] for p in datos["percentil"]]
+
+    fig, ax = plt.subplots(figsize=(9, 3.2))
+    ax.plot(x, datos["percentil"], color="lightgray", linewidth=1, zorder=1)
+    for cat, color in colores.items():
+        mask = [e == cat for e in etiquetas]
+        ax.scatter(
+            [xi for xi, m in zip(x, mask) if m],
+            datos.loc[mask, "percentil"],
+            color=color, label=cat, zorder=2, s=35,
+        )
+    ax.axhline(UMBRAL_VERDE, color="#DDB13A", linestyle="--", linewidth=1)
+    ax.axhline(UMBRAL_AMBAR, color="#C44E52", linestyle="--", linewidth=1)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(datos["Subcycle"], rotation=90, fontsize=7)
+    ax.set_xlabel("Subciclo (orden de ejecución)")
+    ax.set_ylabel("Percentil de anomalía")
+    ax.set_ylim(0, 1.05)
+    ax.legend(loc="upper left", fontsize=8, ncol=3)
+    fig.tight_layout()
+    return fig
+
+
 def render_tab_anomalias():
     st.subheader("Detección de anomalías (IPR)")
 
     modelo_bundle = cargar_modelo()
     engine, engine_qitdb = conexiones()
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        vib = st.selectbox("Modelo de producto (VIB)", opciones_vib(engine_qitdb))
-    with col2:
-        test_name = st.selectbox("Test", opciones_test(engine_qitdb, vib) if vib else [])
-    with col3:
-        snr_df = opciones_snr(engine_qitdb, vib, test_name) if (vib and test_name) else pd.DataFrame()
-        etiquetas_snr = [
-            f"{row.SNR}  ({pd.to_datetime(row.FechaInicio).date()})"
-            for row in snr_df.itertuples()
-        ] if not snr_df.empty else []
-        snr_elegido = st.selectbox("SNR", etiquetas_snr)
+    st.markdown("#### Últimos ensayos")
+    ultimos = opciones_ultimos_tests(engine_qitdb)
+    seleccion = st.dataframe(
+        ultimos[["VIB", "TestName", "SNR", "FechaInicio", "Resultado"]],
+        use_container_width=True, hide_index=True,
+        on_select="rerun", selection_mode="single-row", key="tabla_ultimos",
+    )
 
-    analizar = bool(snr_elegido)
+    fila = None
+    filas_seleccionadas = seleccion.selection.rows if seleccion is not None else []
+    if filas_seleccionadas:
+        fila = ultimos.iloc[filas_seleccionadas[0]]
+        vib, test_name = fila["VIB"], fila["TestName"]
+        st.caption(f"Ensayo seleccionado de la tabla: **{vib} / {test_name} / SNR {fila['SNR']}**")
+    else:
+        st.markdown("#### O bien, filtrar manualmente")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            vib = st.selectbox("Modelo de producto (VIB)", opciones_vib(engine_qitdb))
+        with col2:
+            test_name = st.selectbox("Test", opciones_test(engine_qitdb, vib) if vib else [])
+        with col3:
+            snr_df = opciones_snr(engine_qitdb, vib, test_name) if (vib and test_name) else pd.DataFrame()
+            etiquetas_snr = [
+                f"{row.SNR}  ({pd.to_datetime(row.FechaInicio).date()})"
+                for row in snr_df.itertuples()
+            ] if not snr_df.empty else []
+            snr_elegido = st.selectbox("SNR", etiquetas_snr)
+        if snr_elegido:
+            fila = snr_df.iloc[etiquetas_snr.index(snr_elegido)]
 
-    if not analizar:
-        st.caption("Selecciona un ensayo (VIB → Test → SNR). El análisis se lanza "
-                   "automáticamente en cuanto eliges el SNR; la consulta a la base "
-                   "de datos puede tardar unos segundos.")
+    if fila is None:
+        st.caption("Selecciona un ensayo en la tabla de arriba, o usa los filtros "
+                   "manuales. El análisis se lanza automáticamente al seleccionar; "
+                   "la consulta a la base de datos puede tardar unos segundos.")
         return
-
-    fila = snr_df.iloc[etiquetas_snr.index(snr_elegido)]
 
     with st.spinner("Consultando la base de datos y puntuando el ensayo..."):
         features_df = construir_features_test(
@@ -204,6 +265,9 @@ def render_tab_anomalias():
     st.metric("Percentil de anomalía del ensayo (peor subciclo)", f"{percentil_test:.0%}")
     st.caption(f"Subciclo más anómalo: **{subciclo_peor}** — umbral de alerta: percentil > "
                f"{UMBRAL_AMBAR:.0%}; atención entre {UMBRAL_VERDE:.0%} y {UMBRAL_AMBAR:.0%}.")
+
+    st.markdown("### Evolución por subciclo")
+    st.pyplot(graficar_evolucion_subciclos(features_df))
 
     st.markdown("### Detalle por subciclo")
     tabla = features_df[["Subcycle", "Repetition", "score_anomalia", "percentil"]].copy()
