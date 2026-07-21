@@ -51,11 +51,19 @@ ENSAYOS_CSV = "ensayos_ipr_todos.csv"
 # todas las variantes de fuego/modulo (F1, F2, PAN_F1, etc.) sin tener que
 # mantener una lista manual.
 
-# Captura solo "F{n}" justo despues de "Measured_Power_", ignorando
-# cualquier sufijo posterior (modulo M70/M80, tecnologia MPX_3I/4I/5I,
-# etc.). Variables PAN ya se excluyen en la consulta SQL, no hace falta
-# contemplarlas aqui.
-VAR_PATTERN = re.compile(r"^Measured_Power_(F\d+)(?:_.*)?$")
+# Captura el prefijo de variable + "F{n}" justo antes del sufijo de
+# modulo/tecnologia (M70/M80/MPX_3I/4I/5I...), para las tres familias de
+# variable que usamos: potencia medida, temperatura de cristal, y
+# consigna de potencia (UI_Target_Power). Variables PAN se excluyen en
+# la consulta SQL, no hace falta contemplarlas aqui.
+VAR_PATTERN = re.compile(
+    r"^(Measured_Power|Temperature_Glass|UI_Target_Power)_(F\d+)(?:_.*)?$"
+)
+
+# Umbral por debajo del cual la consigna de potencia se considera "fuego
+# apagado": ahi el error de seguimiento se calcula en valor absoluto (un
+# error porcentual no tiene sentido si se divide por ~0).
+UMBRAL_CONSIGNA_APAGADO = 5.0
 
 # Mismo regex que ya usa la app para extraer niveles de fuego del NOMBRE
 # del subciclo (campo QIT2_Subciclos.Nombre, no SbRep.Subcycle)
@@ -177,18 +185,21 @@ def build_query():
       AND TIP.TestName = ?
       AND seq.TimeStamp >= ?
       AND seq.TimeStamp < ?
-      AND VA.Variable_Name LIKE 'Measured_Power%'
-      AND VA.Variable_Name NOT LIKE 'Measured_Power_PAN%'
+      AND (VA.Variable_Name LIKE 'Measured_Power%'
+           OR VA.Variable_Name LIKE 'Temperature_Glass%'
+           OR VA.Variable_Name LIKE 'UI_Target_Power%')
+      AND VA.Variable_Name NOT LIKE '%PAN%'
     GROUP BY SbRep.Subcycle, SbRep.Repetition, VA.Variable_Name
     """
 
 
 def canonical_name(var_name):
     """Measured_Power_F3_MPX_3I_M80 -> Measured_Power_F3 (se colapsan
-    modulo y sufijo de tecnologia, se conserva el prefijo tal cual)"""
+    modulo y sufijo de tecnologia, se conserva el prefijo de variable
+    tal cual: Measured_Power / Temperature_Glass / UI_Target_Power)"""
     m = VAR_PATTERN.match(var_name)
     if m:
-        return f"Measured_Power_{m.group(1)}"
+        return f"{m.group(1)}_{m.group(2)}"
     return var_name
 
 
@@ -304,6 +315,25 @@ def main():
             for _, r in grupo.iterrows():
                 for stat in STATS:
                     fila[f"{stat}__{r['var_canon']}"] = r[stat]
+
+            # Variable derivada: error de seguimiento de potencia por fuego
+            # (medido vs. consigna). Hibrido: si la consigna es
+            # practicamente 0 (fuego apagado), error en valor absoluto (un
+            # % no tiene sentido al dividir por ~0); si hay consigna real,
+            # error porcentual (una desviacion de 10W no pesa igual si la
+            # consigna es de 50W que si es de 2000W).
+            fuegos_presentes = {c.split("_F")[-1] for c in fila
+                                 if c.startswith("mean_val__Measured_Power_F")}
+            for num_fuego in fuegos_presentes:
+                medido = fila.get(f"mean_val__Measured_Power_F{num_fuego}")
+                consigna = fila.get(f"mean_val__UI_Target_Power_F{num_fuego}")
+                if medido is None or consigna is None or pd.isna(medido) or pd.isna(consigna):
+                    continue
+                if abs(consigna) < UMBRAL_CONSIGNA_APAGADO:
+                    error = medido - consigna  # absoluto, consigna ~0
+                else:
+                    error = (medido - consigna) / consigna  # porcentual
+                fila[f"power_tracking_error_F{num_fuego}"] = error
 
             all_rows.append(fila)
 
