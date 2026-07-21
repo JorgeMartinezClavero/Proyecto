@@ -1,112 +1,334 @@
 """
-Amplia la exploracion de umbrales de 11_explorar_umbral.py en dos
-direcciones, para comprobar si la recomendacion de umbral es robusta:
+Construye un dataset con una fila por (test, subciclo), en vez de una fila
+por test entero. Cada fila incluye:
+  - VIB (categoria, para que el modelo distinga familias/productos)
+  - nivel de cada fuego, obtenido de QIT_DB.QIT2_Subciclos.Nombre (via
+    QIT2_Ciclos_Subciclos/QIT2_Ciclos), parseado con el mismo regex que
+    ya usa app2.py -- NO se infiere de SbRep.Subcycle, que es solo un
+    indice de orden de ejecucion sin informacion de configuracion.
+  - estadisticos (mean/std/min/max) de las variables de potencia
+    (Measured_Power_*) para ese subciclo concreto.
 
-  1) Compara el recall obtenido con los fallos REALES frente al recall
-     obtenido con las anomalias SINTETICAS, a los mismos umbrales --
-     no para decidir con las sinteticas (ya sabemos que miden un tipo
-     de desviacion distinto), sino para ver si el "precipicio" que se
-     observa con los reales aparece tambien ahi, como comprobacion
-     cruzada de que no es un artefacto de tener solo 33 casos.
-
-  2) Repite el calculo de recall/precision variando el criterio de
-     "fallo fiable" (UltimoSubciclo > 5, > 10, > 15) para ver si la
-     recomendacion de umbral se mantiene estable o cambia mucho segun
-     donde se ponga ese corte.
+NOTA: ya no se restringe a una "ventana temprana" -- se usa toda la
+duracion disponible de cada test. El objetivo dejo de ser "alerta
+temprana" y paso a ser deteccion general de comportamiento anomalo, asi
+que maximizamos volumen de entrenamiento en vez de limitarlo.
 
 Requiere:
-    subciclos_con_scores.parquet
-    sinteticos_con_scores.parquet
-    ensayos_ipr_todos.csv          (tiene la columna UltimoSubciclo)
+    pip install pandas pyodbc sqlalchemy tqdm
 
 Uso:
-    python 12_umbral_sensibilidad.py
+    python 04_build_subcycle_dataset.py
+Salida:
+    subciclos_features.parquet
 """
 
+import re
 import pandas as pd
 import numpy as np
+from sqlalchemy import create_engine
+from tqdm import tqdm
 
-SCORES_PARQUET = "subciclos_con_scores.parquet"
-SINTETICOS_PARQUET = "sinteticos_con_scores.parquet"
+# ============================== CONFIG ==============================
+
+# Servidor donde vive Measurement_all
+CONN_STR = (
+    "mssql+pyodbc://@TU_SERVIDOR/QIT_DATAMINING_20"
+    "?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
+)
+
+# Servidor donde vive QIT_DB (Ensayos, y tambien QIT2_Ciclos_Subciclos /
+# QIT2_Subciclos / QIT2_Ciclos, la definicion real de cada subciclo)
+CONN_STR_QITDB = (
+    "mssql+pyodbc://@TU_SERVIDOR_QITDB/QIT_DB"
+    "?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
+)
+
 ENSAYOS_CSV = "ensayos_ipr_todos.csv"
-MODELO = "anomaly_score__OneClassSVM"
 
-UMBRALES_PCT_ALERTA = [30, 25, 20, 15, 10, 7, 5, 3]
-CRITERIOS_MIN_SUBCICLO = [5, 10, 15]
+# Ya no filtramos variables desde Python: la query usa
+# VA.Variable_Name LIKE 'Measured_Power%' directamente en SQL, así cogemos
+# todas las variantes de fuego/modulo (F1, F2, PAN_F1, etc.) sin tener que
+# mantener una lista manual.
+
+# Captura solo "F{n}" justo despues de "Measured_Power_", ignorando
+# cualquier sufijo posterior (modulo M70/M80, tecnologia MPX_3I/4I/5I,
+# etc.). Variables PAN ya se excluyen en la consulta SQL, no hace falta
+# contemplarlas aqui.
+VAR_PATTERN = re.compile(r"^Measured_Power_(F\d+)(?:_.*)?$")
+
+# Mismo regex que ya usa la app para extraer niveles de fuego del NOMBRE
+# del subciclo (campo QIT2_Subciclos.Nombre, no SbRep.Subcycle)
+SUBCYCLE_NAME_PATTERN = r"F(\d+)_N?([a-zA-Z0-9\[\]]+)"
+
+STATS = ["mean_val", "std_val", "min_val", "max_val"]
+
+OUTPUT_PATH = "subciclos_features.parquet"
+
+# ======================================================================
 
 
-def agregar_por_test(df, columna_score=MODELO):
-    grp = df.groupby(["SNR", "VIB", "TestName"])
-    return grp[columna_score].max().reset_index().rename(columns={columna_score: "score_max"})
+def conversion_segura_int(val):
+    """Copiado de app2.py: algunos niveles no son puramente numericos."""
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return val
 
 
-def calcular_recall_precision(agg, es_positivo, referencia, umbrales_pct):
-    filas = []
-    n_pos = int(es_positivo.sum())
-    for pct in umbrales_pct:
-        umbral = 1 - pct / 100
-        percentiles = agg["score_max"].apply(lambda s: np.searchsorted(referencia, s) / len(referencia))
-        marcados = percentiles > umbral
-        capturados = marcados & es_positivo
-        n_capturados = int(capturados.sum())
-        n_marcados = int(marcados.sum())
-        filas.append({
-            "top_%_marcado": pct,
-            "n_marcados": n_marcados,
-            "n_positivos_capturados": n_capturados,
-            "n_positivos_total": n_pos,
-            "recall": n_capturados / n_pos if n_pos else np.nan,
-            "precision": n_capturados / n_marcados if n_marcados else np.nan,
-        })
-    return pd.DataFrame(filas)
+# Codigos de nivel de fuego que aparecen y no encajan en el patron F{x} ni
+# en BA. Se van registrando aqui para poder revisarlos y ampliar el mapeo
+# si aparece algo mas aparte de BA.
+UNMAPPED_CODES = set()
+
+
+def parse_nivel_fuego(val):
+    """
+    Convierte el codigo de nivel de fuego a un entero. El formato real
+    (confirmado con datos: SC_F1_N0_F2_N0_F3_N9_F4_N9_..._POWERVECTOR)
+    es un digito simple 0-9 tras la "N" (10 niveles reales), mas un
+    codigo especial BA (nivel "booster", por encima del maximo normal).
+    Cualquier otro codigo no reconocido se deja como NaN y se registra
+    en UNMAPPED_CODES para poder revisarlo.
+    """
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return np.nan
+
+    val_str = str(val).strip().upper()
+
+    if val_str == "BA":
+        return 10  # un nivel por encima del maximo normal (9)
+
+    if re.fullmatch(r"\d+", val_str):
+        return int(val_str)
+
+    UNMAPPED_CODES.add(val_str)
+    return np.nan
+
+
+def fetch_subcycle_definitions(engine_qitdb, test_names):
+    """
+    Trae, para el conjunto de TestName presentes en el dataset, la
+    definicion real de cada subciclo (Nombre) desde QIT_DB, y parsea los
+    niveles de fuego con el mismo regex que ya usa la app.
+    Se hace UNA vez para todos los tests (no por test), igual que en app2.py.
+    """
+    tests_in_list = ", ".join(f"'{t}'" for t in test_names)
+    query_ciclos = f"""
+        SELECT c.[Nombre_Identificador_Ciclo] AS TestName,
+               cs.[OrdenEjecucion] AS Subcycle,
+               s.[Nombre]
+        FROM [QIT_DB].[dbo].[QIT2_Ciclos_Subciclos] cs
+        INNER JOIN [QIT_DB].[dbo].[QIT2_Subciclos] s
+            ON cs.[ID_Subiclo] = s.[ID_Subciclo]
+        INNER JOIN [QIT_DB].[dbo].[QIT2_Ciclos] c
+            ON c.ID_Ciclo = cs.ID_Ciclo
+        WHERE c.[Nombre_Identificador_Ciclo] IN ({tests_in_list})
+    """
+    df_ciclos = pd.read_sql(query_ciclos, engine_qitdb)
+    df_ciclos["TestName"] = df_ciclos["TestName"].astype(str)
+    df_ciclos["Subcycle"] = df_ciclos["Subcycle"].astype(int)
+
+    patrones = df_ciclos["Nombre"].fillna("").str.extractall(SUBCYCLE_NAME_PATTERN)
+    if not patrones.empty:
+        # OJO: antes se asignaba la columna por el ORDEN de aparicion en el
+        # texto (nivel_F1 = primer match, nivel_F2 = segundo match...), lo
+        # cual es incorrecto si un nombre de subciclo no menciona los fuegos
+        # siempre en el orden F1,F2,F3,F4,F5 -- se mezclaban niveles de
+        # fuegos distintos bajo la columna equivocada. Ahora se usa el
+        # NUMERO DE FUEGO REAL capturado por el regex (grupo 0) para saber
+        # a que columna pertenece cada nivel (grupo 1).
+        patrones = patrones.rename(columns={0: "Fuego", 1: "Nivel"})
+        df_temp = patrones.reset_index(level="match", drop=True)
+        df_niveles = (
+            df_temp.groupby([df_temp.index, "Fuego"])["Nivel"]
+            .first()  # por seguridad, si un fuego apareciera duplicado en el nombre
+            .unstack(level="Fuego")
+        )
+        df_niveles.columns = [f"nivel_F{col}" for col in df_niveles.columns]
+        for col in df_niveles.columns:
+            df_niveles[col] = df_niveles[col].apply(parse_nivel_fuego)
+        df_ciclos = df_ciclos.join(df_niveles)
+
+    return df_ciclos.rename(columns={"Nombre": "Subcycle_Name"})
+
+
+def build_query():
+    return """
+    SELECT
+        SbRep.Subcycle,
+        SbRep.Repetition,
+        VA.Variable_Name,
+        COUNT(*)                              AS n_points,
+        AVG(CAST(m.Measurement AS FLOAT))     AS mean_val,
+        STDEV(CAST(m.Measurement AS FLOAT))   AS std_val,
+        MIN(m.Measurement)                    AS min_val,
+        MAX(m.Measurement)                    AS max_val
+    FROM Measurement_all AS m
+    JOIN VA        ON m.ID_VA = VA.ID_VA
+    JOIN Sequence  AS seq ON m.ID_Sequence = seq.ID_Sequence
+    JOIN SbRep     ON seq.ID_SbRep = SbRep.ID_SbRep
+    JOIN TIP       ON SbRep.ID_TIP = TIP.ID_TIP
+    JOIN TPS       ON TPS.ID_TPS = TIP.ID_TPS
+    JOIN DUT       ON DUT.ID_DUT = TPS.ID_DUT
+    WHERE DUT.SNR = ?
+      AND DUT.FD = ?
+      AND DUT.VIB = ?
+      AND TIP.TestName = ?
+      AND seq.TimeStamp >= ?
+      AND seq.TimeStamp < ?
+      AND VA.Variable_Name LIKE 'Measured_Power%'
+      AND VA.Variable_Name NOT LIKE 'Measured_Power_PAN%'
+    GROUP BY SbRep.Subcycle, SbRep.Repetition, VA.Variable_Name
+    """
+
+
+def canonical_name(var_name):
+    """Measured_Power_F3_MPX_3I_M80 -> Measured_Power_F3 (se colapsan
+    modulo y sufijo de tecnologia, se conserva el prefijo tal cual)"""
+    m = VAR_PATTERN.match(var_name)
+    if m:
+        return f"Measured_Power_{m.group(1)}"
+    return var_name
+
+
+def coerce_nivel_columns(df, nivel_cols):
+    """
+    Las columnas nivel_F* pueden mezclar numeros y codigos especiales no
+    numericos (ej. 'BA'), porque conversion_segura_int() devuelve el valor
+    tal cual cuando no puede convertirlo a int. Una columna con tipos
+    mezclados rompe el guardado a parquet (pyarrow exige tipo consistente
+    por columna). Como estas columnas se usan como variables NUMERICAS en
+    el modelo de anomalias, forzamos a numerico y tratamos los codigos
+    especiales como dato no disponible (NaN) en vez de como texto.
+    """
+    for col in nivel_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
 
 def main():
-    df = pd.read_parquet(SCORES_PARQUET)
-    ensayos = pd.read_csv(
-        ENSAYOS_CSV, sep=';',
-        dtype={"SNR": str, "VIB": str, "TestName": str, "FD": str}
-    )
-    col_subciclo = "UltimoSubciclo" if "UltimoSubciclo" in ensayos.columns else "Subciclo"
-    ensayos_ultimo = ensayos[["SNR", "VIB", "TestName", col_subciclo]].drop_duplicates()
+    ensayos = pd.read_csv(ENSAYOS_CSV, sep=';', dtype={"FD": str, "SNR": str, "VIB": str, "TestName": str})
+    print(f"Tests a procesar: {len(ensayos)}")
 
-    df = df.merge(ensayos_ultimo, on=["SNR", "VIB", "TestName"], how="left")
+    engine = create_engine(CONN_STR)
+    engine_qitdb = create_engine(CONN_STR_QITDB)
+    query = build_query()
 
-    agg = agregar_por_test(df)
-    es_ok_test = (
-        df.groupby(["SNR", "VIB", "TestName"])["Resultado"]
-        .first().astype(str).str.upper().eq("OK").reset_index(drop=True)
-    )
-    referencia = np.sort(agg.loc[es_ok_test.values, "score_max"].values)
+    # Descartamos filas con SNR/FD/VIB/TestName vacios: no se pueden
+    # consultar (pyodbc no acepta NaN donde espera texto) y solo hacen
+    # perder tiempo con errores.
+    n_antes = len(ensayos)
+    ensayos = ensayos.dropna(subset=["SNR", "FD", "VIB", "TestName"])
+    if len(ensayos) < n_antes:
+        print(f"Descartados {n_antes - len(ensayos)} tests con SNR/FD/VIB/TestName vacio")
 
-    resultados_reales = {}
-    for min_subciclo in CRITERIOS_MIN_SUBCICLO:
-        es_nok = df.groupby(["SNR", "VIB", "TestName"]).apply(
-            lambda g: (g["Resultado"].astype(str).str.upper().isin(["NOK_FUNC", "NOK_FUNC_EST"]).any())
-            and (g[col_subciclo].max() > min_subciclo)
-        ).reset_index(drop=True)
-        tabla = calcular_recall_precision(agg, es_nok, referencia, UMBRALES_PCT_ALERTA)
-        resultados_reales[min_subciclo] = tabla
+    # Definicion de subciclos (niveles de fuego), UNA sola vez para todos
+    # los TestName presentes, igual que hace app2.py
+    test_names = ensayos["TestName"].unique().tolist()
+    df_subciclos_def = fetch_subcycle_definitions(engine_qitdb, test_names)
+    nivel_cols = [c for c in df_subciclos_def.columns if c.startswith("nivel_F")]
+    print(f"Definiciones de subciclo cargadas: {len(df_subciclos_def)} "
+          f"({len(nivel_cols)} fuegos detectados)")
+    if UNMAPPED_CODES:
+        print(f"[AVISO] Codigos de nivel no reconocidos (quedan como NaN): "
+              f"{sorted(UNMAPPED_CODES)} -- si son validos, hay que ampliar "
+              f"el mapeo en parse_nivel_fuego()")
 
-    # --- Sinteticas: cada fila ya es su propio "test" (SNR/TestName unicos) ---
-    df_sint = pd.read_parquet(SINTETICOS_PARQUET)
-    agg_sint_solo = df_sint.groupby(["SNR", "VIB", "TestName"])[MODELO].max().reset_index()
-    agg_sint_solo = agg_sint_solo.rename(columns={MODELO: "score_max"})
-    es_sint = pd.Series(True, index=agg_sint_solo.index)
-    tabla_sint = calcular_recall_precision(agg_sint_solo, es_sint, referencia, UMBRALES_PCT_ALERTA)
+    all_rows = []
+    n_empty = 0
+    n_error = 0
+    n_ok = 0
+    for i, (idx, row) in enumerate(tqdm(ensayos.iterrows(), total=len(ensayos))):
+        fecha_inicio = pd.to_datetime(row["FechaInicio"])
+        # Ya no restringimos a una ventana temprana: cogemos todo el rango
+        # disponible del test (hasta FechaFin si ya acabo, o "ahora" si
+        # sigue en curso). Ya no buscamos alerta temprana, solo detectar
+        # comportamiento anomalo en general, así que maximizamos volumen.
+        fecha_fin_raw = pd.to_datetime(row["FechaFin"]) if pd.notna(row["FechaFin"]) else None
+        # Si FechaFin es un valor placeholder/centinela (ej. 1904-01-01,
+        # tipico de SQL Server para "sin fecha real") o es anterior al
+        # inicio, tratamos el test como si siguiera en curso.
+        if fecha_fin_raw is None or fecha_fin_raw <= fecha_inicio:
+            fecha_fin = pd.Timestamp.now()
+        else:
+            fecha_fin = fecha_fin_raw
 
-    # --- Tabla combinada para comparar de un vistazo ---
-    combinada = pd.DataFrame({"top_%_marcado": UMBRALES_PCT_ALERTA})
-    for min_subciclo, tabla in resultados_reales.items():
-        combinada[f"recall_real (min_subciclo>{min_subciclo})"] = tabla["recall"].values
-    combinada["recall_sintetico"] = tabla_sint["recall"].values
+        snr_padded = str(row["SNR"]).zfill(10)
+        fd_padded = str(row["FD"]).zfill(10)
+        # OJO: params debe ser una TUPLA, no una lista -- pandas interpreta
+        # una lista como "varias filas de parametros" y falla con
+        # "List argument must consist only of tuples or dictionaries".
+        params = (snr_padded, fd_padded, row["VIB"], row["TestName"],
+                  fecha_inicio, fecha_fin)
 
-    print("===== Recall por umbral: sensibilidad al criterio de fiabilidad + sintetico =====")
-    print(combinada.to_string(index=False, formatters={
-        c: "{:.1%}".format for c in combinada.columns if c != "top_%_marcado"
-    }))
-    combinada.to_csv("umbral_sensibilidad.csv", index=False)
-    print("\nGuardado umbral_sensibilidad.csv")
+        if i == 0:
+            print("\n===== DEBUG: primer test, para probar a mano en SSMS =====")
+            print(f"SNR original='{row['SNR']}' -> con zfill='{snr_padded}'")
+            print(f"FD original='{row['FD']}' -> con zfill='{fd_padded}'")
+            print(f"VIB='{row['VIB']}'  TestName='{row['TestName']}'")
+            print(f"fecha_inicio={fecha_inicio}  fecha_fin={fecha_fin}")
+            print("Query:", query)
+
+        try:
+            df = pd.read_sql(query, engine, params=params)
+        except Exception as e:
+            n_error += 1
+            if n_error <= 5:
+                print(f"  [WARN] fallo consultando SNR={row['SNR']} Test={row['TestName']}: {e}")
+            continue
+        if df.empty:
+            n_empty += 1
+            continue
+        n_ok += 1
+
+        df["var_canon"] = df["Variable_Name"].apply(canonical_name)
+
+        # niveles de fuego de este TestName (misma definicion para todas
+        # las unidades que corren ese ciclo)
+        niveles_test = df_subciclos_def[df_subciclos_def["TestName"] == row["TestName"]]
+
+        for (subciclo, repeticion), grupo in df.groupby(["Subcycle", "Repetition"]):
+            fila_niveles = niveles_test[niveles_test["Subcycle"] == subciclo]
+            fila = {col: (fila_niveles.iloc[0][col] if not fila_niveles.empty else np.nan)
+                    for col in nivel_cols}
+
+            fila["VIB"] = row["VIB"]
+            fila["SNR"] = row["SNR"]
+            fila["TestName"] = row["TestName"]
+            fila["Subcycle"] = subciclo
+            fila["Repetition"] = repeticion
+            fila["Resultado"] = row["Resultado"]
+            fila["Estado"] = row.get("Estado", np.nan)
+
+            for _, r in grupo.iterrows():
+                for stat in STATS:
+                    fila[f"{stat}__{r['var_canon']}"] = r[stat]
+
+            all_rows.append(fila)
+
+        # Guardado incremental cada 100 tests: si el proceso se corta a
+        # mitad (se cae la conexion, se cierra el portatil...), no se
+        # pierden los ~50 minutos enteros -- se puede retomar desde el
+        # ultimo parcial guardado. Envuelto en try/except para que un
+        # fallo de guardado no tire el resto del proceso en curso.
+        if (i + 1) % 100 == 0 and all_rows:
+            try:
+                df_parcial = pd.DataFrame(all_rows)
+                coerce_nivel_columns(df_parcial, nivel_cols)
+                df_parcial.to_parquet(OUTPUT_PATH + ".parcial", index=False)
+            except Exception as e:
+                print(f"  [WARN] no se pudo guardar el parcial en el test {i+1}: {e}")
+
+    print(f"\nResumen consultas: {n_ok} con datos, {n_empty} vacias, {n_error} con error "
+          f"(de {len(ensayos)} tests)")
+
+    dataset = pd.DataFrame(all_rows)
+    coerce_nivel_columns(dataset, nivel_cols)
+    print(f"\nDataset final: {dataset.shape[0]} filas (test x subciclo) "
+          f"x {dataset.shape[1]} columnas")
+    dataset.to_parquet(OUTPUT_PATH, index=False)
+    print(f"Guardado en {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
