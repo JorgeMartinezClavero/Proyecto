@@ -57,19 +57,18 @@ def main():
 
     for _, t in ok_tests.iterrows():
         q = """
-            SELECT TOP 1 SNR, FD, VIB, Ciclo AS TestName, FechaInicio, FechaFin
+            SELECT SNR, FD, VIB, Ciclo AS TestName, FechaInicio, FechaFin
             FROM QIT_DB.dbo.Ensayos
             WHERE Area='IPR' AND VIB = ? AND Ciclo = ?
         """
         info = pd.read_sql(q, engine_qitdb, params=(t["VIB"], t["TestName"]),
                            dtype={"SNR": str, "FD": str})
+        # filtrar por el SNR concreto DESPUES de traer todas las ejecuciones
+        # de ese VIB+Test (comparando sin ceros a la izquierda)
         info = info[info["SNR"].apply(norm_snr) == norm_snr(t["SNR"])]
         if info.empty:
-            info = pd.read_sql(q, engine_qitdb, params=(t["VIB"], t["TestName"]),
-                               dtype={"SNR": str, "FD": str})
-            if info.empty:
-                print(f"[{t['SNR']}/{t['VIB']}/{t['TestName']}] no encontrado en Ensayos, salto")
-                continue
+            print(f"[{t['SNR']}/{t['VIB']}/{t['TestName']}] no encontrado en Ensayos, salto")
+            continue
         fila = info.iloc[0]
 
         feats = app_mod.construir_features_test(
