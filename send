@@ -1,331 +1,371 @@
 """
-Pestaña Streamlit: detección de anomalías para un ensayo IPR seleccionado.
+Construye un dataset con una fila por (test, subciclo), en vez de una fila
+por test entero. Cada fila incluye:
+  - VIB (categoria, para que el modelo distinga familias/productos)
+  - nivel de cada fuego, obtenido de QIT_DB.QIT2_Subciclos.Nombre (via
+    QIT2_Ciclos_Subciclos/QIT2_Ciclos), parseado con el mismo regex que
+    ya usa app2.py -- NO se infiere de SbRep.Subcycle, que es solo un
+    indice de orden de ejecucion sin informacion de configuracion.
+  - estadisticos (mean/std/min/max) de las variables de potencia
+    (Measured_Power_*) para ese subciclo concreto.
 
-Filtra un ensayo (VIB -> TestName -> SNR), y al pulsar "Analizar anomalías"
-extrae de SQL Server las mismas variables agregadas por subciclo que se
-usaron para entrenar el modelo (04_build_subcycle_dataset.py), las puntúa
-con el modelo ya entrenado (modelo_final_oneclasssvm.joblib) y muestra:
-  - un semaforo con el veredicto global del ensayo (percentil del peor
-    subciclo respecto a la distribucion de ensayos normales)
-  - una tabla con el score/percentil de cada subciclo, para localizar
-    en cual concreto se dispara la alerta
-
-Requiere en la misma carpeta:
-    modelo_final_oneclasssvm.joblib  (generado por 05_train_anomaly_models.py)
-    04_build_subcycle_dataset.py     (se reutiliza su logica de extraccion)
+NOTA: ya no se restringe a una "ventana temprana" -- se usa toda la
+duracion disponible de cada test. El objetivo dejo de ser "alerta
+temprana" y paso a ser deteccion general de comportamiento anomalo, asi
+que maximizamos volumen de entrenamiento en vez de limitarlo.
 
 Requiere:
-    pip install streamlit pandas numpy scikit-learn joblib pyodbc sqlalchemy
+    pip install pandas pyodbc sqlalchemy tqdm
 
 Uso:
-    streamlit run app_tab_anomalias.py
+    python 04_build_subcycle_dataset.py
+Salida:
+    subciclos_features.parquet
 """
 
-import importlib.util
-import numpy as np
+import re
 import pandas as pd
-import joblib
-import streamlit as st
-import matplotlib.pyplot as plt
+import numpy as np
 from sqlalchemy import create_engine
+from tqdm import tqdm
 
-# --- Reutilizamos la logica ya validada de 04_build_subcycle_dataset.py,
-# en vez de duplicarla (mismo canonizado de variables, mismo parseo de
-# niveles de fuego, misma query de agregacion) ---
-spec = importlib.util.spec_from_file_location("build_ds", "04_build_subcycle_dataset.py")
-build_ds = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(build_ds)
+# ============================== CONFIG ==============================
 
-MODELO_PATH = "modelo_final_pca.joblib"
+# Servidor donde vive Measurement_all
+CONN_STR = (
+    "mssql+pyodbc://@TU_SERVIDOR/QIT_DATAMINING_20"
+    "?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
+)
 
-UMBRAL_VERDE = 0.85  # top 15% marcado (ajustado tras analisis recall/precision, ver 11_explorar_umbral.py)
-UMBRAL_AMBAR = 0.95
+# Servidor donde vive QIT_DB (Ensayos, y tambien QIT2_Ciclos_Subciclos /
+# QIT2_Subciclos / QIT2_Ciclos, la definicion real de cada subciclo)
+CONN_STR_QITDB = (
+    "mssql+pyodbc://@TU_SERVIDOR_QITDB/QIT_DB"
+    "?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
+)
+
+ENSAYOS_CSV = "ensayos_ipr_todos.csv"
+
+# Ya no filtramos variables desde Python: la query usa
+# VA.Variable_Name LIKE 'Measured_Power%' directamente en SQL, así cogemos
+# todas las variantes de fuego/modulo (F1, F2, PAN_F1, etc.) sin tener que
+# mantener una lista manual.
+
+# Captura el prefijo de variable + "F{n}" justo antes del sufijo de
+# modulo/tecnologia (M70/M80/MPX_3I/4I/5I...), para las tres familias de
+# variable que usamos: potencia medida, temperatura de cristal, y
+# consigna de potencia (UI_Target_Power). Variables PAN se excluyen en
+# la consulta SQL, no hace falta contemplarlas aqui.
+VAR_PATTERN = re.compile(
+    r"^(Measured_Power|Temperature_Glass|UI_Target_Power)_(F\d+)(?:_.*)?$"
+)
+
+# Umbral por debajo del cual la consigna de potencia se considera "fuego
+# apagado": ahi el error de seguimiento se calcula en valor absoluto (un
+# error porcentual no tiene sentido si se divide por ~0).
+UMBRAL_CONSIGNA_APAGADO = 5.0
+
+# Mismo regex que ya usa la app para extraer niveles de fuego del NOMBRE
+# del subciclo (campo QIT2_Subciclos.Nombre, no SbRep.Subcycle)
+SUBCYCLE_NAME_PATTERN = r"F(\d+)_N?([a-zA-Z0-9\[\]]+)"
+
+STATS = ["mean_val", "std_val", "min_val", "max_val"]
+
+OUTPUT_PATH = "subciclos_features.parquet"
+
+# ======================================================================
 
 
-@st.cache_resource
-def cargar_modelo():
-    return joblib.load(MODELO_PATH)
+def conversion_segura_int(val):
+    """Copiado de app2.py: algunos niveles no son puramente numericos."""
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return val
 
 
-@st.cache_resource
-def conexiones():
-    return create_engine(build_ds.CONN_STR), create_engine(build_ds.CONN_STR_QITDB)
+# Codigos de nivel de fuego que aparecen y no encajan en el patron F{x} ni
+# en BA. Se van registrando aqui para poder revisarlos y ampliar el mapeo
+# si aparece algo mas aparte de BA.
+UNMAPPED_CODES = set()
 
 
-@st.cache_data(ttl=600)
-def opciones_vib(_engine_qitdb):
-    q = "SELECT DISTINCT VIB FROM QIT_DB.dbo.Ensayos WHERE Area='IPR' ORDER BY VIB"
-    return pd.read_sql(q, _engine_qitdb)["VIB"].tolist()
-
-
-@st.cache_data(ttl=600)
-def opciones_test(_engine_qitdb, vib):
-    q = f"""
-        SELECT DISTINCT Ciclo AS TestName FROM QIT_DB.dbo.Ensayos
-        WHERE Area='IPR' AND VIB = '{vib}'
-        ORDER BY Ciclo
+def parse_nivel_fuego(val):
     """
-    return pd.read_sql(q, _engine_qitdb)["TestName"].tolist()
-
-
-@st.cache_data(ttl=600)
-def opciones_snr(_engine_qitdb, vib, test_name):
-    q = f"""
-        SELECT SNR, FD, FechaInicio, FechaFin
-        FROM QIT_DB.dbo.Ensayos
-        WHERE Area='IPR' AND VIB = '{vib}' AND Ciclo = '{test_name}'
-        ORDER BY FechaInicio DESC
+    Convierte el codigo de nivel de fuego a un entero. El formato real
+    (confirmado con datos: SC_F1_N0_F2_N0_F3_N9_F4_N9_..._POWERVECTOR)
+    es un digito simple 0-9 tras la "N" (10 niveles reales), mas un
+    codigo especial BA (nivel "booster", por encima del maximo normal).
+    Cualquier otro codigo no reconocido se deja como NaN y se registra
+    en UNMAPPED_CODES para poder revisarlo.
     """
-    return pd.read_sql(q, _engine_qitdb, dtype={"SNR": str, "FD": str})
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return np.nan
+
+    val_str = str(val).strip().upper()
+
+    if val_str == "BA":
+        return 10  # un nivel por encima del maximo normal (9)
+
+    if re.fullmatch(r"\d+", val_str):
+        return int(val_str)
+
+    UNMAPPED_CODES.add(val_str)
+    return np.nan
 
 
-@st.cache_data(ttl=300)
-def opciones_ultimos_tests(_engine_qitdb, n=30):
-    q = f"""
-        SELECT TOP {n} VIB, Ciclo AS TestName, SNR, FD, FechaInicio, FechaFin, Resultado
-        FROM QIT_DB.dbo.Ensayos
-        WHERE Area='IPR'
-        ORDER BY FechaInicio DESC
+def fetch_subcycle_definitions(engine_qitdb, test_names):
     """
-    return pd.read_sql(q, _engine_qitdb, dtype={"SNR": str, "FD": str})
-
-
-def construir_features_test(engine, engine_qitdb, snr, fd, vib, test_name, fecha_inicio, fecha_fin):
-    """Reconstruye, para UN ensayo, exactamente el mismo dataframe de
-    features por subciclo que 04_build_subcycle_dataset.py genera para
-    todo el histórico -- misma agregacion, mismo canonizado, mismos
-    niveles de fuego."""
-    query = build_ds.build_query()
-    fecha_fin_efectiva = fecha_fin if pd.notna(fecha_fin) else pd.Timestamp.now()
-
-    params = (str(snr).zfill(10), str(fd).zfill(10), vib, test_name,
-              pd.to_datetime(fecha_inicio), pd.to_datetime(fecha_fin_efectiva))
-    df = pd.read_sql(query, engine, params=params)
-    if df.empty:
-        return None
-
-    df["var_canon"] = df["Variable_Name"].apply(build_ds.canonical_name)
-
-    df_niveles = build_ds.fetch_subcycle_definitions(engine_qitdb, [test_name])
-    nivel_cols = [c for c in df_niveles.columns if c.startswith("nivel_F")]
-    niveles_test = df_niveles[df_niveles["TestName"] == test_name]
-
-    filas = []
-    for (subciclo, repeticion), grupo in df.groupby(["Subcycle", "Repetition"]):
-        fila_niveles = niveles_test[niveles_test["Subcycle"] == subciclo]
-        fila = {col: (fila_niveles.iloc[0][col] if not fila_niveles.empty else np.nan)
-                for col in nivel_cols}
-        fila["VIB"] = vib
-        fila["Subcycle"] = subciclo
-        fila["Repetition"] = repeticion
-        for _, r in grupo.iterrows():
-            for stat in build_ds.STATS:
-                # Temperature_Glass se mantiene en la unidad interna del
-                # sensor (decimas de grado), igual que en el dataset con el
-                # que se entreno el modelo. La escala es irrelevante para el
-                # modelo (el StandardScaler la normaliza), lo critico es que
-                # app y entrenamiento usen LA MISMA.
-                fila[f"{stat}__{r['var_canon']}"] = r[stat]
-
-        # Misma variable derivada que 04: error de seguimiento de potencia
-        # por fuego (hibrido: % si hay consigna real, absoluto si ~0)
-        fuegos_presentes = {c.split("_F")[-1] for c in fila
-                             if c.startswith("mean_val__Measured_Power_F")}
-        for num_fuego in fuegos_presentes:
-            medido = fila.get(f"mean_val__Measured_Power_F{num_fuego}")
-            consigna = fila.get(f"mean_val__UI_Target_Power_F{num_fuego}")
-            if medido is None or consigna is None or pd.isna(medido) or pd.isna(consigna):
-                continue
-            if abs(consigna) < build_ds.UMBRAL_CONSIGNA_APAGADO:
-                error = medido - consigna
-            else:
-                error = (medido - consigna) / consigna
-            fila[f"power_tracking_error_F{num_fuego}"] = error
-
-        filas.append(fila)
-
-    resultado = pd.DataFrame(filas)
-    if nivel_cols:
-        build_ds.coerce_nivel_columns(resultado, nivel_cols)
-    return resultado
-
-
-def puntuar(features_df, modelo_bundle):
-    """Aplica el preprocesador + scaler + modelo YA AJUSTADOS (nunca se
-    reentrena nada aqui) y devuelve:
-      - el score/percentil de CADA subciclo (respecto a otros subciclos
-        sueltos -- util para el detalle, no para el veredicto global)
-      - el percentil del ENSAYO completo (el maximo de sus scores,
-        comparado con el maximo de otros ensayos normales -- esta es la
-        comparacion correctamente calibrada, ver nota en 05_train_anomaly_models.py)
+    Trae, para el conjunto de TestName presentes en el dataset, la
+    definicion real de cada subciclo (Nombre) desde QIT_DB, y parsea los
+    niveles de fuego con el mismo regex que ya usa la app.
+    Se hace UNA vez para todos los tests (no por test), igual que en app2.py.
     """
-    feature_cols = modelo_bundle["feature_cols"]
-    num_cols = modelo_bundle["num_cols"]
+    tests_in_list = ", ".join(f"'{t}'" for t in test_names)
+    query_ciclos = f"""
+        SELECT c.[Nombre_Identificador_Ciclo] AS TestName,
+               cs.[OrdenEjecucion] AS Subcycle,
+               s.[Nombre]
+        FROM [QIT_DB].[dbo].[QIT2_Ciclos_Subciclos] cs
+        INNER JOIN [QIT_DB].[dbo].[QIT2_Subciclos] s
+            ON cs.[ID_Subiclo] = s.[ID_Subciclo]
+        INNER JOIN [QIT_DB].[dbo].[QIT2_Ciclos] c
+            ON c.ID_Ciclo = cs.ID_Ciclo
+        WHERE c.[Nombre_Identificador_Ciclo] IN ({tests_in_list})
+    """
+    df_ciclos = pd.read_sql(query_ciclos, engine_qitdb)
+    df_ciclos["TestName"] = df_ciclos["TestName"].astype(str)
+    df_ciclos["Subcycle"] = df_ciclos["Subcycle"].astype(int)
 
-    for col in feature_cols:
-        if col not in features_df.columns:
-            features_df[col] = np.nan
-    X = features_df[feature_cols]
-
-    X_t = modelo_bundle["preprocessor"].transform(X)
-    X_num = modelo_bundle["scaler"].transform(X_t[:, :len(num_cols)])
-    X_scaled = np.hstack([X_num, X_t[:, len(num_cols):]])
-
-    tipo_modelo = modelo_bundle.get("tipo_modelo", "svm")
-    if tipo_modelo == "pca":
-        # Score = error de reconstruccion (PCA): cuanto peor se reconstruye
-        # una fila a partir de sus componentes principales, mas anomala es.
-        X_rec = modelo_bundle["model"].inverse_transform(
-            modelo_bundle["model"].transform(X_scaled)
+    patrones = df_ciclos["Nombre"].fillna("").str.extractall(SUBCYCLE_NAME_PATTERN)
+    if not patrones.empty:
+        # OJO: antes se asignaba la columna por el ORDEN de aparicion en el
+        # texto (nivel_F1 = primer match, nivel_F2 = segundo match...), lo
+        # cual es incorrecto si un nombre de subciclo no menciona los fuegos
+        # siempre en el orden F1,F2,F3,F4,F5 -- se mezclaban niveles de
+        # fuegos distintos bajo la columna equivocada. Ahora se usa el
+        # NUMERO DE FUEGO REAL capturado por el regex (grupo 0) para saber
+        # a que columna pertenece cada nivel (grupo 1).
+        patrones = patrones.rename(columns={0: "Fuego", 1: "Nivel"})
+        df_temp = patrones.reset_index(level="match", drop=True)
+        df_niveles = (
+            df_temp.groupby([df_temp.index, "Fuego"])["Nivel"]
+            .first()  # por seguridad, si un fuego apareciera duplicado en el nombre
+            .unstack(level="Fuego")
         )
-        scores = np.mean((X_scaled - X_rec) ** 2, axis=1)
-    else:
-        scores = -modelo_bundle["model"].decision_function(X_scaled)
+        df_niveles.columns = [f"nivel_F{col}" for col in df_niveles.columns]
+        for col in df_niveles.columns:
+            df_niveles[col] = df_niveles[col].apply(parse_nivel_fuego)
+        df_ciclos = df_ciclos.join(df_niveles)
 
-    referencia_subciclo = modelo_bundle["referencia_scores"]
-    percentiles_subciclo = np.searchsorted(referencia_subciclo, scores) / len(referencia_subciclo)
-
-    referencia_test = modelo_bundle["referencia_scores_test"]
-    score_test = scores.max()
-    percentil_test = np.searchsorted(referencia_test, score_test) / len(referencia_test)
-
-    return scores, percentiles_subciclo, percentil_test
+    return df_ciclos.rename(columns={"Nombre": "Subcycle_Name"})
 
 
-def color_semaforo(percentil):
-    if percentil <= UMBRAL_VERDE:
-        return "🟢", "Normal"
-    elif percentil <= UMBRAL_AMBAR:
-        return "🟡", "Atención"
-    else:
-        return "🔴", "Alerta"
+def build_query():
+    return """
+    SELECT
+        SbRep.Subcycle,
+        SbRep.Repetition,
+        VA.Variable_Name,
+        COUNT(*)                              AS n_points,
+        AVG(CAST(m.Measurement AS FLOAT))     AS mean_val,
+        STDEV(CAST(m.Measurement AS FLOAT))   AS std_val,
+        MIN(m.Measurement)                    AS min_val,
+        MAX(m.Measurement)                    AS max_val
+    FROM Measurement_all AS m
+    JOIN VA        ON m.ID_VA = VA.ID_VA
+    JOIN Sequence  AS seq ON m.ID_Sequence = seq.ID_Sequence
+    JOIN SbRep     ON seq.ID_SbRep = SbRep.ID_SbRep
+    JOIN TIP       ON SbRep.ID_TIP = TIP.ID_TIP
+    JOIN TPS       ON TPS.ID_TPS = TIP.ID_TPS
+    JOIN DUT       ON DUT.ID_DUT = TPS.ID_DUT
+    WHERE DUT.SNR = ?
+      AND DUT.FD = ?
+      AND DUT.VIB = ?
+      AND TIP.TestName = ?
+      AND seq.TimeStamp >= ?
+      AND seq.TimeStamp < ?
+      AND (VA.Variable_Name LIKE 'Measured_Power%'
+           OR VA.Variable_Name LIKE 'Temperature_Glass%'
+           OR VA.Variable_Name LIKE 'UI_Target_Power%')
+      AND VA.Variable_Name NOT LIKE '%PAN%'
+    GROUP BY SbRep.Subcycle, SbRep.Repetition, VA.Variable_Name
+    """
 
 
-def graficar_evolucion_subciclos(features_df):
-    """Grafica el percentil de anomalia a lo largo del ensayo (ordenado
-    por repeticion y subciclo), coloreando los puntos segun el semaforo
-    -- version simplificada, para un unico ensayo, de la Figura 4 de la
-    memoria (evolucion del score por subciclo)."""
-    datos = features_df.sort_values(["Repetition", "Subcycle"]).reset_index(drop=True)
-    x = range(len(datos))
-    colores = {
-        "Normal": "#55A868",
-        "Atención": "#DDB13A",
-        "Alerta": "#C44E52",
-    }
-    etiquetas = [color_semaforo(p)[1] for p in datos["percentil"]]
-
-    fig, ax = plt.subplots(figsize=(9, 3.2))
-    ax.plot(x, datos["percentil"], color="lightgray", linewidth=1, zorder=1)
-    for cat, color in colores.items():
-        mask = [e == cat for e in etiquetas]
-        ax.scatter(
-            [xi for xi, m in zip(x, mask) if m],
-            datos.loc[mask, "percentil"],
-            color=color, label=cat, zorder=2, s=35,
-        )
-    ax.axhline(UMBRAL_VERDE, color="#DDB13A", linestyle="--", linewidth=1)
-    ax.axhline(UMBRAL_AMBAR, color="#C44E52", linestyle="--", linewidth=1)
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(datos["Subcycle"], rotation=90, fontsize=7)
-    ax.set_xlabel("Subciclo (orden de ejecución)")
-    ax.set_ylabel("Percentil de anomalía")
-    ax.set_ylim(0, 1.05)
-    ax.legend(loc="upper left", fontsize=8, ncol=3)
-    fig.tight_layout()
-    return fig
+def canonical_name(var_name):
+    """Measured_Power_F3_MPX_3I_M80 -> Measured_Power_F3 (se colapsan
+    modulo y sufijo de tecnologia, se conserva el prefijo de variable
+    tal cual: Measured_Power / Temperature_Glass / UI_Target_Power)"""
+    m = VAR_PATTERN.match(var_name)
+    if m:
+        return f"{m.group(1)}_{m.group(2)}"
+    return var_name
 
 
-def render_tab_anomalias():
-    st.subheader("Detección de anomalías (IPR)")
+def coerce_nivel_columns(df, nivel_cols):
+    """
+    Las columnas nivel_F* pueden mezclar numeros y codigos especiales no
+    numericos (ej. 'BA'), porque conversion_segura_int() devuelve el valor
+    tal cual cuando no puede convertirlo a int. Una columna con tipos
+    mezclados rompe el guardado a parquet (pyarrow exige tipo consistente
+    por columna). Como estas columnas se usan como variables NUMERICAS en
+    el modelo de anomalias, forzamos a numerico y tratamos los codigos
+    especiales como dato no disponible (NaN) en vez de como texto.
+    """
+    for col in nivel_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    modelo_bundle = cargar_modelo()
-    engine, engine_qitdb = conexiones()
 
-    st.markdown("#### Últimos ensayos")
-    n_mostrar = st.slider("Nº de ensayos a mostrar", min_value=20, max_value=300,
-                           value=100, step=20)
-    ultimos = opciones_ultimos_tests(engine_qitdb, n=n_mostrar)
-    seleccion = st.dataframe(
-        ultimos[["VIB", "TestName", "SNR", "FechaInicio", "Resultado"]],
-        use_container_width=True, hide_index=True,
-        on_select="rerun", selection_mode="single-row", key="tabla_ultimos",
-    )
+def main():
+    ensayos = pd.read_csv(ENSAYOS_CSV, sep=';', dtype={"FD": str, "SNR": str, "VIB": str, "TestName": str})
+    print(f"Tests a procesar: {len(ensayos)}")
 
-    fila = None
-    filas_seleccionadas = seleccion.selection.rows if seleccion is not None else []
-    if filas_seleccionadas:
-        fila = ultimos.iloc[filas_seleccionadas[0]]
-        vib, test_name = fila["VIB"], fila["TestName"]
-        st.caption(f"Ensayo seleccionado de la tabla: **{vib} / {test_name} / SNR {fila['SNR']}**")
-    else:
-        st.markdown("#### O bien, filtrar manualmente")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            vib = st.selectbox("Modelo de producto (VIB)", opciones_vib(engine_qitdb))
-        with col2:
-            test_name = st.selectbox("Test", opciones_test(engine_qitdb, vib) if vib else [])
-        with col3:
-            snr_df = opciones_snr(engine_qitdb, vib, test_name) if (vib and test_name) else pd.DataFrame()
-            etiquetas_snr = [
-                f"{row.SNR}  ({pd.to_datetime(row.FechaInicio).date()})"
-                for row in snr_df.itertuples()
-            ] if not snr_df.empty else []
-            snr_elegido = st.selectbox("SNR", etiquetas_snr)
-        if snr_elegido:
-            fila = snr_df.iloc[etiquetas_snr.index(snr_elegido)]
+    engine = create_engine(CONN_STR)
+    engine_qitdb = create_engine(CONN_STR_QITDB)
+    query = build_query()
 
-    if fila is None:
-        st.caption("Selecciona un ensayo en la tabla de arriba, o usa los filtros "
-                   "manuales. El análisis se lanza automáticamente al seleccionar; "
-                   "la consulta a la base de datos puede tardar unos segundos.")
-        return
+    # Descartamos filas con SNR/FD/VIB/TestName vacios: no se pueden
+    # consultar (pyodbc no acepta NaN donde espera texto) y solo hacen
+    # perder tiempo con errores.
+    n_antes = len(ensayos)
+    ensayos = ensayos.dropna(subset=["SNR", "FD", "VIB", "TestName"])
+    if len(ensayos) < n_antes:
+        print(f"Descartados {n_antes - len(ensayos)} tests con SNR/FD/VIB/TestName vacio")
 
-    with st.spinner("Consultando la base de datos y puntuando el ensayo..."):
-        features_df = construir_features_test(
-            engine, engine_qitdb,
-            fila["SNR"], fila["FD"], vib, test_name,
-            fila["FechaInicio"], fila["FechaFin"],
-        )
+    # Definicion de subciclos (niveles de fuego), UNA sola vez para todos
+    # los TestName presentes, igual que hace app2.py
+    test_names = ensayos["TestName"].unique().tolist()
+    df_subciclos_def = fetch_subcycle_definitions(engine_qitdb, test_names)
+    nivel_cols = [c for c in df_subciclos_def.columns if c.startswith("nivel_F")]
+    print(f"Definiciones de subciclo cargadas: {len(df_subciclos_def)} "
+          f"({len(nivel_cols)} fuegos detectados)")
+    if UNMAPPED_CODES:
+        print(f"[AVISO] Codigos de nivel no reconocidos (quedan como NaN): "
+              f"{sorted(UNMAPPED_CODES)} -- si son validos, hay que ampliar "
+              f"el mapeo en parse_nivel_fuego()")
 
-    if features_df is None or features_df.empty:
-        st.warning("No se han encontrado datos de sensores para este ensayo en el "
-                   "rango de fechas disponible.")
-        return
+    all_rows = []
+    n_empty = 0
+    n_error = 0
+    n_ok = 0
+    for i, (idx, row) in enumerate(tqdm(ensayos.iterrows(), total=len(ensayos))):
+        fecha_inicio = pd.to_datetime(row["FechaInicio"])
+        # Ya no restringimos a una ventana temprana: cogemos todo el rango
+        # disponible del test (hasta FechaFin si ya acabo, o "ahora" si
+        # sigue en curso). Ya no buscamos alerta temprana, solo detectar
+        # comportamiento anomalo en general, así que maximizamos volumen.
+        fecha_fin_raw = pd.to_datetime(row["FechaFin"]) if pd.notna(row["FechaFin"]) else None
+        # Si FechaFin es un valor placeholder/centinela (ej. 1904-01-01,
+        # tipico de SQL Server para "sin fecha real") o es anterior al
+        # inicio, tratamos el test como si siguiera en curso.
+        if fecha_fin_raw is None or fecha_fin_raw <= fecha_inicio:
+            fecha_fin = pd.Timestamp.now()
+        else:
+            fecha_fin = fecha_fin_raw
 
-    scores, percentiles_subciclo, percentil_test = puntuar(features_df, modelo_bundle)
-    features_df["score_anomalia"] = scores
-    features_df["percentil"] = percentiles_subciclo
+        snr_padded = str(row["SNR"]).zfill(10)
+        fd_padded = str(row["FD"]).zfill(10)
+        # OJO: params debe ser una TUPLA, no una lista -- pandas interpreta
+        # una lista como "varias filas de parametros" y falla con
+        # "List argument must consist only of tuples or dictionaries".
+        params = (snr_padded, fd_padded, row["VIB"], row["TestName"],
+                  fecha_inicio, fecha_fin)
 
-    # veredicto del ensayo: percentil de su score maximo frente a la
-    # referencia de ensayos completos (NO el maximo de los percentiles de
-    # subciclo, que sale sesgado hacia arriba por tener muchos subciclos)
-    idx_peor = int(np.argmax(scores))
-    subciclo_peor = features_df.iloc[idx_peor]["Subcycle"]
-    icono, etiqueta = color_semaforo(percentil_test)
+        if i == 0:
+            print("\n===== DEBUG: primer test, para probar a mano en SSMS =====")
+            print(f"SNR original='{row['SNR']}' -> con zfill='{snr_padded}'")
+            print(f"FD original='{row['FD']}' -> con zfill='{fd_padded}'")
+            print(f"VIB='{row['VIB']}'  TestName='{row['TestName']}'")
+            print(f"fecha_inicio={fecha_inicio}  fecha_fin={fecha_fin}")
+            print("Query:", query)
 
-    st.markdown(f"## {icono}  Resultado: **{etiqueta}**")
-    st.metric("Percentil de anomalía del ensayo", f"{percentil_test:.0%}")
-    st.caption(f"Subciclo más anómalo: **{subciclo_peor}** — umbral de alerta: percentil > "
-               f"{UMBRAL_AMBAR:.0%}; atención entre {UMBRAL_VERDE:.0%} y {UMBRAL_AMBAR:.0%}. "
-               f"(El percentil de cada subciclo individual en la tabla de abajo es "
-               f"orientativo, relativo a otros subciclos sueltos; el veredicto global "
-               f"usa la comparación correcta entre ensayos completos.)")
+        try:
+            df = pd.read_sql(query, engine, params=params)
+        except Exception as e:
+            n_error += 1
+            if n_error <= 5:
+                print(f"  [WARN] fallo consultando SNR={row['SNR']} Test={row['TestName']}: {e}")
+            continue
+        if df.empty:
+            n_empty += 1
+            continue
+        n_ok += 1
 
-    st.markdown("### Evolución por subciclo")
-    st.pyplot(graficar_evolucion_subciclos(features_df))
+        df["var_canon"] = df["Variable_Name"].apply(canonical_name)
 
-    st.markdown("### Detalle por subciclo")
-    tabla = features_df[["Subcycle", "Repetition", "score_anomalia", "percentil"]].copy()
-    tabla["semáforo"] = tabla["percentil"].apply(lambda p: color_semaforo(p)[0])
-    tabla = tabla.sort_values("percentil", ascending=False).reset_index(drop=True)
-    tabla["percentil"] = tabla["percentil"].map(lambda p: f"{p:.0%}")
-    st.dataframe(
-        tabla[["semáforo", "Subcycle", "Repetition", "score_anomalia", "percentil"]],
-        use_container_width=True, hide_index=True,
-    )
+        # niveles de fuego de este TestName (misma definicion para todas
+        # las unidades que corren ese ciclo)
+        niveles_test = df_subciclos_def[df_subciclos_def["TestName"] == row["TestName"]]
+
+        for (subciclo, repeticion), grupo in df.groupby(["Subcycle", "Repetition"]):
+            fila_niveles = niveles_test[niveles_test["Subcycle"] == subciclo]
+            fila = {col: (fila_niveles.iloc[0][col] if not fila_niveles.empty else np.nan)
+                    for col in nivel_cols}
+
+            fila["VIB"] = row["VIB"]
+            fila["SNR"] = row["SNR"]
+            fila["TestName"] = row["TestName"]
+            fila["Subcycle"] = subciclo
+            fila["Repetition"] = repeticion
+            fila["Resultado"] = row["Resultado"]
+            fila["Estado"] = row.get("Estado", np.nan)
+
+            for _, r in grupo.iterrows():
+                for stat in STATS:
+                    # Temperature_Glass se mantiene en la unidad interna del
+                    # sensor (decimas de grado: 200 = 20,0 C). No se convierte
+                    # a grados: la escala es irrelevante para el modelo (el
+                    # StandardScaler normaliza cada columna) y mantener la
+                    # unidad original garantiza coherencia con el modelo ya
+                    # entrenado y con la app, que replican esta misma logica.
+                    fila[f"{stat}__{r['var_canon']}"] = r[stat]
+
+            # Variable derivada: error de seguimiento de potencia por fuego
+            # (medido vs. consigna). Hibrido: si la consigna es
+            # practicamente 0 (fuego apagado), error en valor absoluto (un
+            # % no tiene sentido al dividir por ~0); si hay consigna real,
+            # error porcentual (una desviacion de 10W no pesa igual si la
+            # consigna es de 50W que si es de 2000W).
+            fuegos_presentes = {c.split("_F")[-1] for c in fila
+                                 if c.startswith("mean_val__Measured_Power_F")}
+            for num_fuego in fuegos_presentes:
+                medido = fila.get(f"mean_val__Measured_Power_F{num_fuego}")
+                consigna = fila.get(f"mean_val__UI_Target_Power_F{num_fuego}")
+                if medido is None or consigna is None or pd.isna(medido) or pd.isna(consigna):
+                    continue
+                if abs(consigna) < UMBRAL_CONSIGNA_APAGADO:
+                    error = medido - consigna  # absoluto, consigna ~0
+                else:
+                    error = (medido - consigna) / consigna  # porcentual
+                fila[f"power_tracking_error_F{num_fuego}"] = error
+
+            all_rows.append(fila)
+
+        # Guardado incremental cada 100 tests: si el proceso se corta a
+        # mitad (se cae la conexion, se cierra el portatil...), no se
+        # pierden los ~50 minutos enteros -- se puede retomar desde el
+        # ultimo parcial guardado. Envuelto en try/except para que un
+        # fallo de guardado no tire el resto del proceso en curso.
+        if (i + 1) % 100 == 0 and all_rows:
+            try:
+                df_parcial = pd.DataFrame(all_rows)
+                coerce_nivel_columns(df_parcial, nivel_cols)
+                df_parcial.to_parquet(OUTPUT_PATH + ".parcial", index=False)
+            except Exception as e:
+                print(f"  [WARN] no se pudo guardar el parcial en el test {i+1}: {e}")
+
+    print(f"\nResumen consultas: {n_ok} con datos, {n_empty} vacias, {n_error} con error "
+          f"(de {len(ensayos)} tests)")
+
+    dataset = pd.DataFrame(all_rows)
+    coerce_nivel_columns(dataset, nivel_cols)
+    print(f"\nDataset final: {dataset.shape[0]} filas (test x subciclo) "
+          f"x {dataset.shape[1]} columnas")
+    dataset.to_parquet(OUTPUT_PATH, index=False)
+    print(f"Guardado en {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
-    st.set_page_config(page_title="Detección de anomalías", layout="wide")
-    render_tab_anomalias()
+    main()
