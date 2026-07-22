@@ -1,93 +1,115 @@
 """
-Explora, con los datos ya guardados (sin reentrenar nada), que recall
-(% de fallos reales capturados) y que tasa de alerta sobre ensayos
-normales se obtiene con distintos umbrales de percentil -- para decidir
-con datos, no a ojo, si el 20% (percentil 80) es el punto adecuado dado
-lo poco frecuente que es el fallo real.
+Amplia la exploracion de umbrales de 11_explorar_umbral.py en dos
+direcciones, para comprobar si la recomendacion de umbral es robusta:
+
+  1) Compara el recall obtenido con los fallos REALES frente al recall
+     obtenido con las anomalias SINTETICAS, a los mismos umbrales --
+     no para decidir con las sinteticas (ya sabemos que miden un tipo
+     de desviacion distinto), sino para ver si el "precipicio" que se
+     observa con los reales aparece tambien ahi, como comprobacion
+     cruzada de que no es un artefacto de tener solo 33 casos.
+
+  2) Repite el calculo de recall/precision variando el criterio de
+     "fallo fiable" (UltimoSubciclo > 5, > 10, > 15) para ver si la
+     recomendacion de umbral se mantiene estable o cambia mucho segun
+     donde se ponga ese corte.
 
 Requiere:
-    subciclos_con_scores.parquet   (de 05_train_anomaly_models.py)
-    candidatos_subciclo_alto.csv   (de check_casos_fiables.py)
+    subciclos_con_scores.parquet
+    sinteticos_con_scores.parquet
+    ensayos_ipr_todos.csv          (tiene la columna UltimoSubciclo)
 
 Uso:
-    python 11_explorar_umbral.py
+    python 12_umbral_sensibilidad.py
 """
 
 import pandas as pd
 import numpy as np
 
 SCORES_PARQUET = "subciclos_con_scores.parquet"
-CANDIDATOS_CSV = "candidatos_subciclo_alto.csv"
+SINTETICOS_PARQUET = "sinteticos_con_scores.parquet"
+ENSAYOS_CSV = "ensayos_ipr_todos.csv"
 MODELO = "anomaly_score__OneClassSVM"  # cambia aqui el modelo a analizar segun
                                         # lo que diga 07_test_significancia.py
                                         # (ej. "anomaly_score__PCA (autoencoder lineal)")
 
-# Umbrales candidatos, expresados como "% de ensayos normales marcados
-# como alerta" (top X% mas anomalo)
 UMBRALES_PCT_ALERTA = [30, 25, 20, 15, 10, 7, 5, 3]
+CRITERIOS_MIN_SUBCICLO = [5, 10, 15]
+
+
+def agregar_por_test(df, columna_score=MODELO):
+    grp = df.groupby(["SNR", "VIB", "TestName"])
+    return grp[columna_score].max().reset_index().rename(columns={columna_score: "score_max"})
+
+
+def calcular_recall_precision(agg, es_positivo, referencia, umbrales_pct):
+    filas = []
+    n_pos = int(es_positivo.sum())
+    for pct in umbrales_pct:
+        umbral = 1 - pct / 100
+        percentiles = agg["score_max"].apply(lambda s: np.searchsorted(referencia, s) / len(referencia))
+        marcados = percentiles > umbral
+        capturados = marcados & es_positivo
+        n_capturados = int(capturados.sum())
+        n_marcados = int(marcados.sum())
+        filas.append({
+            "top_%_marcado": pct,
+            "n_marcados": n_marcados,
+            "n_positivos_capturados": n_capturados,
+            "n_positivos_total": n_pos,
+            "recall": n_capturados / n_pos if n_pos else np.nan,
+            "precision": n_capturados / n_marcados if n_marcados else np.nan,
+        })
+    return pd.DataFrame(filas)
 
 
 def main():
     df = pd.read_parquet(SCORES_PARQUET)
-    candidatos = pd.read_csv(
-        CANDIDATOS_CSV, dtype={"SNR": str, "VIB": str, "TestName": str, "FD": str}
+    ensayos = pd.read_csv(
+        ENSAYOS_CSV, sep=';',
+        dtype={"SNR": str, "VIB": str, "TestName": str, "FD": str}
     )
-    fiables = candidatos[candidatos["tiene_datos"].astype(str).str.lower() == "true"]
-    claves_fiables = set(zip(fiables["SNR"], fiables["VIB"], fiables["TestName"]))
+    col_subciclo = "UltimoSubciclo" if "UltimoSubciclo" in ensayos.columns else "Subciclo"
+    ensayos_ultimo = ensayos[["SNR", "VIB", "TestName", col_subciclo]].drop_duplicates()
 
-    es_nok = df["Resultado"].astype(str).str.upper().isin(["NOK_FUNC", "NOK_FUNC_EST"])
-    es_fiable = df.apply(lambda r: (r["SNR"], r["VIB"], r["TestName"]) in claves_fiables, axis=1)
-    df["_nok_fiable"] = es_nok & es_fiable
+    df = df.merge(ensayos_ultimo, on=["SNR", "VIB", "TestName"], how="left")
 
-    # Agregamos a nivel de TEST (maximo), igual que hace ahora la app
-    grp = df.groupby(["SNR", "VIB", "TestName"])
-    agg_max = grp[MODELO].max()
-    es_nok_test = grp["_nok_fiable"].max().astype(bool)
-    agg = pd.DataFrame({"score_max": agg_max, "es_nok": es_nok_test}).reset_index()
-
-    # Referencia: SOLO ensayos normales (igual que en el modelo guardado)
-    referencia = np.sort(agg.loc[~agg["es_nok"], "score_max"].values)
-
-    n_nok_total = int(agg["es_nok"].sum())
-    n_tests_total = len(agg)
-    print(f"Ensayos en el conjunto: {n_tests_total}  |  NOK reales fiables: {n_nok_total}")
-    print(f"Tasa base de fallo real en la muestra: {n_nok_total/n_tests_total:.1%}\n")
-
-    agg["percentil"] = agg["score_max"].apply(
-        lambda s: np.searchsorted(referencia, s) / len(referencia)
+    agg = agregar_por_test(df)
+    es_ok_test = (
+        df.groupby(["SNR", "VIB", "TestName"])["Resultado"]
+        .first().astype(str).str.upper().eq("OK").reset_index(drop=True)
     )
+    referencia = np.sort(agg.loc[es_ok_test.values, "score_max"].values)
 
-    resultados = []
-    for pct_alerta in UMBRALES_PCT_ALERTA:
-        umbral = 1 - pct_alerta / 100
-        capturados = agg.loc[agg["es_nok"], "percentil"] > umbral
-        n_capturados = int(capturados.sum())
-        recall = n_capturados / n_nok_total if n_nok_total else float("nan")
+    resultados_reales = {}
+    for min_subciclo in CRITERIOS_MIN_SUBCICLO:
+        es_nok = df.groupby(["SNR", "VIB", "TestName"]).apply(
+            lambda g: (g["Resultado"].astype(str).str.upper().isin(["NOK_FUNC", "NOK_FUNC_EST"]).any())
+            and (g[col_subciclo].max() > min_subciclo),
+            include_groups=False,
+        ).reset_index(drop=True)
+        tabla = calcular_recall_precision(agg, es_nok, referencia, UMBRALES_PCT_ALERTA)
+        resultados_reales[min_subciclo] = tabla
 
-        # de todos los ensayos marcados en alerta, cuantos son REALMENTE NOK
-        # (precision) -- con esta tasa base tan baja, sera un numero pequeño
-        marcados = agg["percentil"] > umbral
-        n_marcados = int(marcados.sum())
-        precision = n_capturados / n_marcados if n_marcados else float("nan")
+    # --- Sinteticas: cada fila ya es su propio "test" (SNR/TestName unicos) ---
+    df_sint = pd.read_parquet(SINTETICOS_PARQUET)
+    agg_sint_solo = df_sint.groupby(["SNR", "VIB", "TestName"])[MODELO].max().reset_index()
+    agg_sint_solo = agg_sint_solo.rename(columns={MODELO: "score_max"})
+    es_sint = pd.Series(True, index=agg_sint_solo.index)
+    tabla_sint = calcular_recall_precision(agg_sint_solo, es_sint, referencia, UMBRALES_PCT_ALERTA)
 
-        resultados.append({
-            "top_%_marcado": pct_alerta,
-            "n_ensayos_marcados": n_marcados,
-            "NOK_capturados": f"{n_capturados}/{n_nok_total}",
-            "recall": f"{recall:.1%}",
-            "precision (de los marcados, % que son NOK de verdad)": f"{precision:.1%}",
-        })
+    # --- Tabla combinada para comparar de un vistazo ---
+    combinada = pd.DataFrame({"top_%_marcado": UMBRALES_PCT_ALERTA})
+    for min_subciclo, tabla in resultados_reales.items():
+        combinada[f"recall_real (min_subciclo>{min_subciclo})"] = tabla["recall"].values
+    combinada["recall_sintetico"] = tabla_sint["recall"].values
 
-    tabla = pd.DataFrame(resultados)
-    print("===== Umbral vs. recall vs. precision (agregacion por maximo) =====")
-    print(tabla.to_string(index=False))
-    tabla.to_csv("exploracion_umbral.csv", index=False)
-    print("\nGuardado exploracion_umbral.csv")
-    print("\nNota: 'precision' es necesariamente baja con una tasa base de fallo tan "
-          "reducida -- incluso un modelo excelente marcara mayoria de 'falsos positivos' "
-          "en terminos absolutos. Lo relevante es cuanto 'recall' se gana o se pierde al "
-          "mover el umbral, y decidir el punto de equilibrio segun cuantos ensayos esta "
-          "dispuesto a revisar el laboratorio.")
+    print("===== Recall por umbral: sensibilidad al criterio de fiabilidad + sintetico =====")
+    print(combinada.to_string(index=False, formatters={
+        c: "{:.1%}".format for c in combinada.columns if c != "top_%_marcado"
+    }))
+    combinada.to_csv("umbral_sensibilidad.csv", index=False)
+    print("\nGuardado umbral_sensibilidad.csv")
 
 
 if __name__ == "__main__":
