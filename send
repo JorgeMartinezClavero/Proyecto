@@ -1,58 +1,228 @@
 """
-Comprobacion rapida del dataset recien generado por
-04_build_subcycle_dataset.py, antes de lanzar el resto del pipeline.
-Muestra forma, columnas por familia, estadisticos descriptivos y una
-muestra de filas para las variables nuevas (Temperature_Glass,
-UI_Target_Power, power_tracking_error).
+Analisis exploratorio de datos (EDA) sobre el conjunto de datos ya
+construido (subciclos_features.parquet), antes de entrenar los modelos
+de anomalias. Pensado para dar contenido a la memoria: distribucion de
+variables, balance de clases, relacion entre nivel de fuego comandado y
+potencia medida, y correlacion entre variables.
+
+Requiere:
+    pip install pandas numpy matplotlib
 
 Uso:
-    python verificar_dataset.py
+    python 08_eda.py
+Salida (en la carpeta actual):
+    eda_resumen.csv
+    eda1_balance_clases.png
+    eda2_distribucion_vib.png
+    eda3_missing_por_variable.png
+    eda3b_missing_temperatura.png (si hay Temperature_Glass)
+    eda3c_missing_error_seguimiento.png (si hay power_tracking_error)
+    eda4_distribucion_niveles_fuego.png
+    eda5_correlacion_potencias.png
+    eda5b_correlacion_temperaturas.png (si hay Temperature_Glass)
+    eda5c_correlacion_potencia_error.png (si hay power_tracking_error)
+    eda6_nivel_vs_potencia.png
+    eda7_distribucion_error_seguimiento.png (si hay power_tracking_error)
 """
 
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 
 DATA_PATH = "subciclos_features.parquet"
 
 
-def main():
+def cargar():
     df = pd.read_parquet(DATA_PATH)
-    print(f"Dataset: {df.shape[0]} filas x {df.shape[1]} columnas\n")
+    print(f"Dataset: {df.shape[0]} filas x {df.shape[1]} columnas")
+    return df
 
-    familias = {
-        "Niveles de fuego": [c for c in df.columns if c.startswith("nivel_F")],
-        "Potencia medida": [c for c in df.columns if "Measured_Power" in c],
-        "Temperatura de cristal": [c for c in df.columns if "Temperature_Glass" in c],
-        "Consigna de potencia": [c for c in df.columns if "UI_Target_Power" in c],
-        "Error de seguimiento (derivada)": [c for c in df.columns if c.startswith("power_tracking_error")],
-    }
 
-    for nombre, cols in familias.items():
-        print(f"=== {nombre}: {len(cols)} columnas ===")
-        print(cols)
-        print()
+def resumen_general(df):
+    power_cols = [c for c in df.columns if c.startswith("mean_val__Measured_Power")]
+    temp_cols = [c for c in df.columns if c.startswith("mean_val__Temperature_Glass")]
+    target_cols = [c for c in df.columns if c.startswith("mean_val__UI_Target_Power")]
+    error_cols = [c for c in df.columns if c.startswith("power_tracking_error")]
+    nivel_cols = [c for c in df.columns if c.startswith("nivel_F")]
 
-    # Estadisticos descriptivos + % de NaN, solo de las familias nuevas/derivadas
-    cols_nuevas = (familias["Temperatura de cristal"]
-                   + familias["Consigna de potencia"]
-                   + familias["Error de seguimiento (derivada)"])
-    if cols_nuevas:
-        resumen = df[cols_nuevas].describe().T
-        resumen["pct_missing"] = df[cols_nuevas].isna().mean() * 100
-        print("=== Estadisticos descriptivos de las variables nuevas ===")
-        print(resumen.to_string())
-        resumen.to_csv("verificacion_variables_nuevas.csv")
-        print("\nGuardado verificacion_variables_nuevas.csv")
-    else:
-        print("[AVISO] No se encontraron columnas de Temperature_Glass / "
-              "UI_Target_Power / power_tracking_error -- revisa si el script "
-              "04_build_subcycle_dataset.py que corriste ya incluye estas variables.")
+    print("\n===== Resumen general =====")
+    n_tipos_test = df["TestName"].nunique()
+    n_ejecuciones = df[["SNR", "VIB", "TestName"]].drop_duplicates().shape[0]
+    print(f"Tipos de test distintos (TestName): {n_tipos_test}")
+    print(f"Ejecuciones de test (combinación SNR+VIB+TestName): {n_ejecuciones}")
+    print(f"SNR distintos (unidades físicas, ojo: una misma SNR podría "
+          f"aparecer en más de una ejecución): {df['SNR'].nunique()}")
+    print(f"Modelos de producto distintos (VIB): {df['VIB'].nunique()}")
+    print(f"Variables de potencia: {len(power_cols)}  |  Temperatura: {len(temp_cols)}  |  "
+          f"Consigna: {len(target_cols)}  |  Error de seguimiento: {len(error_cols)}  |  "
+          f"Niveles de fuego: {len(nivel_cols)}")
 
-    # Muestra de filas concretas, para ver los valores con tus propios ojos
-    cols_muestra = ["SNR", "TestName", "Subcycle"] + \
-        [c for c in df.columns if "F1" in c and
-         ("Measured_Power" in c or "UI_Target_Power" in c or "power_tracking_error" in c)]
-    print("\n=== Muestra de filas (fuego 1, para comprobar a ojo consigna vs medido vs error) ===")
-    print(df[cols_muestra].dropna(subset=[c for c in cols_muestra if "power_tracking_error" in c]).head(10).to_string(index=False))
+    todas = power_cols + temp_cols + target_cols + error_cols + nivel_cols
+    resumen = df[todas].describe().T
+    resumen["pct_missing"] = df[todas].isna().mean() * 100
+    resumen.to_csv("eda_resumen.csv")
+    print("\nGuardado eda_resumen.csv (estadisticos descriptivos + % de NaN por variable)")
+    return power_cols, temp_cols, target_cols, error_cols, nivel_cols
+
+
+def eda1_balance_clases(df):
+    counts = df["Resultado"].astype(str).str.upper().value_counts()
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    counts.plot(kind="bar", ax=ax, color="#4C72B0", edgecolor="black")
+    ax.set_ylabel("nº de filas (test x subciclo)")
+    ax.set_title("Balance de clases por Resultado")
+    for i, v in enumerate(counts.values):
+        ax.text(i, v, f"{v}\n({v/counts.sum()*100:.1f}%)", ha="center", va="bottom", fontsize=9)
+    fig.tight_layout()
+    fig.savefig("eda1_balance_clases.png", dpi=150, bbox_inches="tight")
+    print("Guardado eda1_balance_clases.png")
+
+
+def eda2_distribucion_vib(df, top_n=15):
+    counts = df["VIB"].value_counts().head(top_n)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    counts.plot(kind="barh", ax=ax, color="#55A868", edgecolor="black")
+    ax.invert_yaxis()
+    ax.set_xlabel("nº de filas (test x subciclo)")
+    ax.set_title(f"Top {top_n} modelos de producto (VIB) con más datos")
+    fig.tight_layout()
+    fig.savefig("eda2_distribucion_vib.png", dpi=150, bbox_inches="tight")
+    print("Guardado eda2_distribucion_vib.png")
+
+
+def eda3_missing_por_variable(df, cols, etiqueta="potencia", archivo="eda3_missing_por_variable.png"):
+    if not cols:
+        print(f"[AVISO] No hay columnas de {etiqueta} para graficar ausencia de datos.")
+        return
+    pct_missing = df[cols].isna().mean().sort_values(ascending=True) * 100
+    fig, ax = plt.subplots(figsize=(7, max(3, 0.35 * len(cols))))
+    pct_missing.plot(kind="barh", ax=ax, color="#C44E52", edgecolor="black")
+    ax.set_xlabel("% de filas con dato ausente")
+    ax.set_title(f"Ausencia de datos por variable de {etiqueta}\n"
+                 "(estructural: no todos los modelos tienen todos los fuegos)")
+    fig.tight_layout()
+    fig.savefig(archivo, dpi=150, bbox_inches="tight")
+    print(f"Guardado {archivo}")
+
+
+def eda4_distribucion_niveles(df, nivel_cols):
+    fig, axes = plt.subplots(1, len(nivel_cols), figsize=(3.2 * len(nivel_cols), 4), sharey=True)
+    if len(nivel_cols) == 1:
+        axes = [axes]
+    for ax, col in zip(axes, nivel_cols):
+        df[col].dropna().plot(kind="hist", bins=19, ax=ax, color="#8172B2", edgecolor="black")
+        ax.set_title(col)
+        ax.set_xlabel("nivel comandado")
+    fig.suptitle("Distribución de niveles de fuego comandados por posición")
+    fig.tight_layout()
+    fig.savefig("eda4_distribucion_niveles_fuego.png", dpi=150, bbox_inches="tight")
+    print("Guardado eda4_distribucion_niveles_fuego.png")
+
+
+def eda5_correlacion(df, cols, titulo="Correlación entre variables de potencia media por fuego",
+                      archivo="eda5_correlacion_potencias.png", prefijo_quitar="mean_val__Measured_Power_"):
+    if len(cols) < 2:
+        print(f"[AVISO] Menos de 2 columnas para correlacionar en '{titulo}', se omite.")
+        return
+    corr = df[cols].corr()
+    fig, ax = plt.subplots(figsize=(max(7, 0.6 * len(cols)), max(6, 0.6 * len(cols))))
+    im = ax.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1)
+    etiquetas = [c.replace(prefijo_quitar, "") for c in cols]
+    ax.set_xticks(range(len(cols)))
+    ax.set_xticklabels(etiquetas, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(len(cols)))
+    ax.set_yticklabels(etiquetas, fontsize=8)
+    for i in range(len(cols)):
+        for j in range(len(cols)):
+            ax.text(j, i, f"{corr.iloc[i,j]:.2f}", ha="center", va="center", fontsize=7)
+    fig.colorbar(im, ax=ax, label="correlación")
+    ax.set_title(titulo)
+    fig.tight_layout()
+    fig.savefig(archivo, dpi=150, bbox_inches="tight")
+    print(f"Guardado {archivo}")
+
+
+def eda7_distribucion_error_seguimiento(df, error_cols):
+    if not error_cols:
+        print("[AVISO] No hay columnas power_tracking_error para graficar.")
+        return
+    fig, axes = plt.subplots(1, len(error_cols), figsize=(3.2 * len(error_cols), 4), sharey=False)
+    if len(error_cols) == 1:
+        axes = [axes]
+    for ax, col in zip(axes, error_cols):
+        datos = df[col].dropna()
+        datos = datos[(datos > datos.quantile(0.01)) & (datos < datos.quantile(0.99))]
+        datos.plot(kind="hist", bins=40, ax=ax, color="#DD8452", edgecolor="black")
+        ax.axvline(0, color="black", linewidth=1, linestyle="--")
+        ax.set_title(col.replace("power_tracking_error_", ""))
+        ax.set_xlabel("error (absoluto si consigna≈0, % si no)")
+    fig.suptitle("Distribución del error de seguimiento de potencia por fuego\n"
+                 "(vista recortada a percentiles 1-99 para legibilidad)")
+    fig.tight_layout()
+    fig.savefig("eda7_distribucion_error_seguimiento.png", dpi=150, bbox_inches="tight")
+    print("Guardado eda7_distribucion_error_seguimiento.png")
+
+
+def eda6_nivel_vs_potencia(df):
+    """Comprobacion de sentido fisico: a mayor nivel comandado, deberia
+    observarse mayor potencia medida en ese mismo fuego."""
+    pares = [(f"nivel_F{i}", f"mean_val__Measured_Power_F{i}") for i in range(1, 6)]
+    pares_validos = [(n, p) for n, p in pares if n in df.columns and p in df.columns]
+
+    fig, axes = plt.subplots(1, len(pares_validos), figsize=(3.5 * len(pares_validos), 4.2), sharey=False)
+    if len(pares_validos) == 1:
+        axes = [axes]
+    for ax, (nivel_col, power_col) in zip(axes, pares_validos):
+        sub = df[[nivel_col, power_col]].dropna()
+        if sub.empty:
+            continue
+        sub.boxplot(column=power_col, by=nivel_col, ax=ax, grid=False)
+        ax.set_title(f"F{nivel_col[-1]}", fontsize=10)
+        ax.set_xlabel("nivel comandado")
+        ax.set_ylabel("potencia media medida")
+    fig.suptitle("Relación entre nivel de fuego comandado y potencia medida")
+    plt.suptitle("Relación entre nivel de fuego comandado y potencia medida")
+    fig.tight_layout()
+    fig.savefig("eda6_nivel_vs_potencia.png", dpi=150, bbox_inches="tight")
+    print("Guardado eda6_nivel_vs_potencia.png")
+
+
+def main():
+    df = cargar()
+    power_cols, temp_cols, target_cols, error_cols, nivel_cols = resumen_general(df)
+
+    eda1_balance_clases(df)
+    eda2_distribucion_vib(df)
+    eda3_missing_por_variable(df, power_cols, etiqueta="potencia",
+                               archivo="eda3_missing_por_variable.png")
+    if temp_cols:
+        eda3_missing_por_variable(df, temp_cols, etiqueta="temperatura de cristal",
+                                   archivo="eda3b_missing_temperatura.png")
+    if error_cols:
+        eda3_missing_por_variable(df, error_cols, etiqueta="error de seguimiento",
+                                   archivo="eda3c_missing_error_seguimiento.png")
+
+    eda4_distribucion_niveles(df, nivel_cols)
+    eda5_correlacion(df, power_cols)
+
+    if temp_cols:
+        eda5_correlacion(
+            df, temp_cols, titulo="Correlación entre variables de temperatura de cristal por fuego",
+            archivo="eda5b_correlacion_temperaturas.png",
+            prefijo_quitar="mean_val__Temperature_Glass_",
+        )
+    if power_cols and error_cols:
+        eda5_correlacion(
+            df, power_cols + error_cols,
+            titulo="Correlación entre potencia medida y error de seguimiento",
+            archivo="eda5c_correlacion_potencia_error.png",
+            prefijo_quitar="mean_val__Measured_Power_",
+        )
+
+    eda6_nivel_vs_potencia(df)
+    eda7_distribucion_error_seguimiento(df, error_cols)
+
+    print("\nEDA completo.")
 
 
 if __name__ == "__main__":
