@@ -1,228 +1,482 @@
 """
-Analisis exploratorio de datos (EDA) sobre el conjunto de datos ya
-construido (subciclos_features.parquet), antes de entrenar los modelos
-de anomalias. Pensado para dar contenido a la memoria: distribucion de
-variables, balance de clases, relacion entre nivel de fuego comandado y
-potencia medida, y correlacion entre variables.
+Entrena y compara modelos de deteccion de anomalias sobre filas
+(test, subciclo), con tres mejoras metodologicas respecto a la primera
+version:
+
+  1) Entrenamiento SEMI-SUPERVISADO: el conjunto de entrenamiento excluye
+     TODO lo etiquetado como fallo (fiable o no), para no contaminar la
+     definicion de "comportamiento normal" con posibles fallos reales.
+
+  2) Validacion OUT-OF-SAMPLE de verdad: se separa un holdout de datos
+     normales que el modelo NUNCA ve durante el entrenamiento. Tanto el
+     chequeo cualitativo (casos NOK reales) como el cuantitativo
+     (anomalias sinteticas) se evaluan sobre ese holdout + los casos NOK,
+     nunca sobre filas ya vistas en el entrenamiento.
+
+  3) Dos modelos nuevos en la comparativa:
+       - Gaussian Mixture Model (varias "sub-poblaciones" normales a la
+         vez, razonable dado que se mezclan ~50 VIBs distintos)
+       - Autoencoder no lineal real (MLPRegressor en configuracion de
+         cuello de botella, entrenado a reconstruirse a si mismo; el
+         error de reconstruccion es el anomaly score). Sin depender de
+         Keras/PyTorch, pero ya no es una aproximacion lineal como PCA.
 
 Requiere:
-    pip install pandas numpy matplotlib
+    pip install pandas numpy scikit-learn matplotlib
 
 Uso:
-    python 08_eda.py
-Salida (en la carpeta actual):
-    eda_resumen.csv
-    eda1_balance_clases.png
-    eda2_distribucion_vib.png
-    eda3_missing_por_variable.png
-    eda3b_missing_temperatura.png (si hay Temperature_Glass)
-    eda3c_missing_error_seguimiento.png (si hay power_tracking_error)
-    eda4_distribucion_niveles_fuego.png
-    eda5_correlacion_potencias.png
-    eda5b_correlacion_temperaturas.png (si hay Temperature_Glass)
-    eda5c_correlacion_potencia_error.png (si hay power_tracking_error)
-    eda6_nivel_vs_potencia.png
-    eda7_distribucion_error_seguimiento.png (si hay power_tracking_error)
+    python 05_train_anomaly_models.py
 """
 
-import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
+import joblib
+
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.svm import OneClassSVM
+from sklearn.mixture import GaussianMixture
+from sklearn.neural_network import MLPRegressor
+from sklearn.decomposition import PCA
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 DATA_PATH = "subciclos_features.parquet"
+CANDIDATOS_FIABLES_CSV = "candidatos_subciclo_alto.csv"
+
+RANDOM_STATE = 42
+CONTAMINATION = 0.01      # tasa esperada de anomalias (ajusta si conoces mejor la real)
+HOLDOUT_FRACTION = 0.20   # % de datos normales reservado para validar out-of-sample
+N_SYNTHETIC = 200         # nº de anomalias sinteticas a inyectar para validar
+PERTURBATION_PCT = 0.30   # perturbacion del 30% sobre las variables de potencia
+
+GMM_N_COMPONENTS = 8      # nº de "sub-poblaciones normales" a modelar
+AUTOENCODER_HIDDEN = (24, 8, 24)  # cuello de botella: 8 << nº de variables de entrada
+
+# One-Class SVM (kernel RBF) escala mal con muchas filas. No hace falta
+# GPU (ningun modelo aqui es deep learning), pero para no tardar horas en
+# un portatil, se entrena sobre una submuestra si hay demasiadas filas.
+MAX_SAMPLES_OCSVM = 8000
+
+MODELOS = ["IsolationForest", "OneClassSVM", "LOF", "GaussianMixture",
+           "PCA (autoencoder lineal)", "Autoencoder (MLP)"]
 
 
-def cargar():
+def load_data():
     df = pd.read_parquet(DATA_PATH)
-    print(f"Dataset: {df.shape[0]} filas x {df.shape[1]} columnas")
-    return df
+    meta_cols = ["SNR", "TestName", "Subcycle", "Repetition", "Resultado", "Estado"]
+    feature_cols = [c for c in df.columns if c not in meta_cols]
+    cat_cols = ["VIB"]
+    num_cols = [c for c in feature_cols if c not in cat_cols]
+    return df, feature_cols, cat_cols, num_cols
 
 
-def resumen_general(df):
-    power_cols = [c for c in df.columns if c.startswith("mean_val__Measured_Power")]
-    temp_cols = [c for c in df.columns if c.startswith("mean_val__Temperature_Glass")]
-    target_cols = [c for c in df.columns if c.startswith("mean_val__UI_Target_Power")]
-    error_cols = [c for c in df.columns if c.startswith("power_tracking_error")]
-    nivel_cols = [c for c in df.columns if c.startswith("nivel_F")]
-
-    print("\n===== Resumen general =====")
-    n_tipos_test = df["TestName"].nunique()
-    n_ejecuciones = df[["SNR", "VIB", "TestName"]].drop_duplicates().shape[0]
-    print(f"Tipos de test distintos (TestName): {n_tipos_test}")
-    print(f"Ejecuciones de test (combinación SNR+VIB+TestName): {n_ejecuciones}")
-    print(f"SNR distintos (unidades físicas, ojo: una misma SNR podría "
-          f"aparecer en más de una ejecución): {df['SNR'].nunique()}")
-    print(f"Modelos de producto distintos (VIB): {df['VIB'].nunique()}")
-    print(f"Variables de potencia: {len(power_cols)}  |  Temperatura: {len(temp_cols)}  |  "
-          f"Consigna: {len(target_cols)}  |  Error de seguimiento: {len(error_cols)}  |  "
-          f"Niveles de fuego: {len(nivel_cols)}")
-
-    todas = power_cols + temp_cols + target_cols + error_cols + nivel_cols
-    resumen = df[todas].describe().T
-    resumen["pct_missing"] = df[todas].isna().mean() * 100
-    resumen.to_csv("eda_resumen.csv")
-    print("\nGuardado eda_resumen.csv (estadisticos descriptivos + % de NaN por variable)")
-    return power_cols, temp_cols, target_cols, error_cols, nivel_cols
+def load_casos_fiables():
+    """
+    Casos NOK_FUNC/NOK_FUNC_EST considerados fiables: UltimoSubciclo > 10
+    (proxy de "el fallo se determino tras suficiente operacion real, no
+    un aborto administrativo temprano" -- ver check_casos_fiables.py).
+    Devuelve el set de (SNR, VIB, TestName) con datos reales y ese
+    criterio cumplido, o None si no se encuentra el fichero.
+    """
+    try:
+        candidatos = pd.read_csv(
+            CANDIDATOS_FIABLES_CSV,
+            dtype={"SNR": str, "VIB": str, "TestName": str, "FD": str},
+        )
+    except FileNotFoundError:
+        print(f"\n[AVISO] No se encontro {CANDIDATOS_FIABLES_CSV} -- corre antes "
+              "check_casos_fiables.py. El chequeo cualitativo se omite.")
+        return None
+    fiables = candidatos[candidatos["tiene_datos"].astype(str).str.lower() == "true"]
+    return set(zip(fiables["SNR"], fiables["VIB"], fiables["TestName"]))
 
 
-def eda1_balance_clases(df):
-    counts = df["Resultado"].astype(str).str.upper().value_counts()
-    fig, ax = plt.subplots(figsize=(6, 4.5))
-    counts.plot(kind="bar", ax=ax, color="#4C72B0", edgecolor="black")
-    ax.set_ylabel("nº de filas (test x subciclo)")
-    ax.set_title("Balance de clases por Resultado")
-    for i, v in enumerate(counts.values):
-        ax.text(i, v, f"{v}\n({v/counts.sum()*100:.1f}%)", ha="center", va="bottom", fontsize=9)
-    fig.tight_layout()
-    fig.savefig("eda1_balance_clases.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda1_balance_clases.png")
+def build_preprocessor(cat_cols, num_cols):
+    return ColumnTransformer([
+        ("num", SimpleImputer(strategy="median"), num_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+    ])
 
 
-def eda2_distribucion_vib(df, top_n=15):
-    counts = df["VIB"].value_counts().head(top_n)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    counts.plot(kind="barh", ax=ax, color="#55A868", edgecolor="black")
-    ax.invert_yaxis()
-    ax.set_xlabel("nº de filas (test x subciclo)")
-    ax.set_title(f"Top {top_n} modelos de producto (VIB) con más datos")
-    fig.tight_layout()
-    fig.savefig("eda2_distribucion_vib.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda2_distribucion_vib.png")
+def _scale_numeric_part(X_fit_t, X_score_t, n_num):
+    """Escala solo la parte numerica (las columnas categoricas ya vienen
+    en 0/1 del one-hot, no hace falta escalarlas)."""
+    scaler = StandardScaler()
+    X_fit_num = scaler.fit_transform(X_fit_t[:, :n_num])
+    X_score_num = scaler.transform(X_score_t[:, :n_num])
+    X_fit_out = np.hstack([X_fit_num, X_fit_t[:, n_num:]])
+    X_score_out = np.hstack([X_score_num, X_score_t[:, n_num:]])
+    return X_fit_out, X_score_out
 
 
-def eda3_missing_por_variable(df, cols, etiqueta="potencia", archivo="eda3_missing_por_variable.png"):
-    if not cols:
-        print(f"[AVISO] No hay columnas de {etiqueta} para graficar ausencia de datos.")
-        return
-    pct_missing = df[cols].isna().mean().sort_values(ascending=True) * 100
-    fig, ax = plt.subplots(figsize=(7, max(3, 0.35 * len(cols))))
-    pct_missing.plot(kind="barh", ax=ax, color="#C44E52", edgecolor="black")
-    ax.set_xlabel("% de filas con dato ausente")
-    ax.set_title(f"Ausencia de datos por variable de {etiqueta}\n"
-                 "(estructural: no todos los modelos tienen todos los fuegos)")
-    fig.tight_layout()
-    fig.savefig(archivo, dpi=150, bbox_inches="tight")
-    print(f"Guardado {archivo}")
+def compute_scores(name, X_fit_raw, X_score_raw, cat_cols, num_cols):
+    """
+    Ajusta el modelo SOLO sobre X_fit_raw (datos normales de entrenamiento)
+    y devuelve el anomaly score (mas alto = mas anomalo) para cada fila de
+    X_score_raw. X_score_raw puede incluir filas nunca vistas en el ajuste.
+    """
+    prep = build_preprocessor(cat_cols, num_cols)
+    X_fit_t = prep.fit_transform(X_fit_raw)
+    X_score_t = prep.transform(X_score_raw)
+    X_fit_t, X_score_t = _scale_numeric_part(X_fit_t, X_score_t, len(num_cols))
+
+    rng = np.random.RandomState(RANDOM_STATE)
+
+    if name == "IsolationForest":
+        model = IsolationForest(contamination=CONTAMINATION,
+                                 random_state=RANDOM_STATE, n_jobs=-1)
+        model.fit(X_fit_t)
+        return -model.score_samples(X_score_t)
+
+    if name == "OneClassSVM":
+        X_train = X_fit_t
+        if X_train.shape[0] > MAX_SAMPLES_OCSVM:
+            idx = rng.choice(X_train.shape[0], size=MAX_SAMPLES_OCSVM, replace=False)
+            X_train = X_train[idx]
+            print(f"  [OneClassSVM] entrenando sobre submuestra de "
+                  f"{MAX_SAMPLES_OCSVM} de {X_fit_t.shape[0]} filas")
+        model = OneClassSVM(nu=CONTAMINATION, kernel="rbf", gamma="scale")
+        model.fit(X_train)
+        return -model.decision_function(X_score_t)
+
+    if name == "LOF":
+        model = LocalOutlierFactor(n_neighbors=35, contamination=CONTAMINATION,
+                                    novelty=True)
+        model.fit(X_fit_t)
+        return -model.score_samples(X_score_t)
+
+    if name == "GaussianMixture":
+        model = GaussianMixture(n_components=GMM_N_COMPONENTS,
+                                 covariance_type="diag", reg_covar=1e-3,
+                                 random_state=RANDOM_STATE)
+        model.fit(X_fit_t)
+        return -model.score_samples(X_score_t)
+
+    if name == "PCA (autoencoder lineal)":
+        pca = PCA(n_components=0.90, random_state=RANDOM_STATE)
+        pca.fit(X_fit_t)
+        X_rec = pca.inverse_transform(pca.transform(X_score_t))
+        return np.mean((X_score_t - X_rec) ** 2, axis=1)
+
+    if name == "Autoencoder (MLP)":
+        mlp = MLPRegressor(hidden_layer_sizes=AUTOENCODER_HIDDEN, max_iter=300,
+                            random_state=RANDOM_STATE, early_stopping=True)
+        mlp.fit(X_fit_t, X_fit_t)
+        X_rec = mlp.predict(X_score_t)
+        return np.mean((X_score_t - X_rec) ** 2, axis=1)
+
+    raise ValueError(f"Modelo desconocido: {name}")
 
 
-def eda4_distribucion_niveles(df, nivel_cols):
-    fig, axes = plt.subplots(1, len(nivel_cols), figsize=(3.2 * len(nivel_cols), 4), sharey=True)
-    if len(nivel_cols) == 1:
-        axes = [axes]
-    for ax, col in zip(axes, nivel_cols):
-        df[col].dropna().plot(kind="hist", bins=19, ax=ax, color="#8172B2", edgecolor="black")
-        ax.set_title(col)
-        ax.set_xlabel("nivel comandado")
-    fig.suptitle("Distribución de niveles de fuego comandados por posición")
-    fig.tight_layout()
-    fig.savefig("eda4_distribucion_niveles_fuego.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda4_distribucion_niveles_fuego.png")
+def inject_synthetic_anomalies(df, n=N_SYNTHETIC, pct=PERTURBATION_PCT):
+    """
+    Copia n filas al azar (del holdout normal, NUNCA del entrenamiento) y
+    perturba SOLO sus variables de potencia medida +/- pct%, simulando un
+    sensor que se desvia de lo esperado. No se tocan nivel_F* (son la
+    configuracion comandada, no algo que un sensor pueda "fallar") ni VIB.
 
+    Importante: tras perturbar la potencia medida, se RECALCULA
+    power_tracking_error_Fx con la misma formula hibrida usada en
+    04_build_subcycle_dataset.py (porcentual si hay consigna real,
+    absoluto si la consigna es ~0). Si no se recalculase, la fila
+    sintetica quedaria con una potencia "falseada" pero un error de
+    seguimiento todavia reflejando la relacion real (no perturbada) entre
+    potencia y consigna -- una incoherencia interna que un fallo real
+    nunca tendria, y que diluye la señal para los modelos de
+    reconstruccion (PCA, autoencoder).
+    """
+    UMBRAL_CONSIGNA_APAGADO = 5.0  # mismo umbral que en 04_build_subcycle_dataset.py
 
-def eda5_correlacion(df, cols, titulo="Correlación entre variables de potencia media por fuego",
-                      archivo="eda5_correlacion_potencias.png", prefijo_quitar="mean_val__Measured_Power_"):
-    if len(cols) < 2:
-        print(f"[AVISO] Menos de 2 columnas para correlacionar en '{titulo}', se omite.")
-        return
-    corr = df[cols].corr()
-    fig, ax = plt.subplots(figsize=(max(7, 0.6 * len(cols)), max(6, 0.6 * len(cols))))
-    im = ax.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1)
-    etiquetas = [c.replace(prefijo_quitar, "") for c in cols]
-    ax.set_xticks(range(len(cols)))
-    ax.set_xticklabels(etiquetas, rotation=45, ha="right", fontsize=8)
-    ax.set_yticks(range(len(cols)))
-    ax.set_yticklabels(etiquetas, fontsize=8)
-    for i in range(len(cols)):
-        for j in range(len(cols)):
-            ax.text(j, i, f"{corr.iloc[i,j]:.2f}", ha="center", va="center", fontsize=7)
-    fig.colorbar(im, ax=ax, label="correlación")
-    ax.set_title(titulo)
-    fig.tight_layout()
-    fig.savefig(archivo, dpi=150, bbox_inches="tight")
-    print(f"Guardado {archivo}")
+    cols_potencia = [c for c in df.columns if "Measured_Power" in c]
+    rng = np.random.RandomState(RANDOM_STATE)
+    sample = df.sample(n=min(n, len(df)), random_state=RANDOM_STATE).copy()
 
-
-def eda7_distribucion_error_seguimiento(df, error_cols):
-    if not error_cols:
-        print("[AVISO] No hay columnas power_tracking_error para graficar.")
-        return
-    fig, axes = plt.subplots(1, len(error_cols), figsize=(3.2 * len(error_cols), 4), sharey=False)
-    if len(error_cols) == 1:
-        axes = [axes]
-    for ax, col in zip(axes, error_cols):
-        datos = df[col].dropna()
-        datos = datos[(datos > datos.quantile(0.01)) & (datos < datos.quantile(0.99))]
-        datos.plot(kind="hist", bins=40, ax=ax, color="#DD8452", edgecolor="black")
-        ax.axvline(0, color="black", linewidth=1, linestyle="--")
-        ax.set_title(col.replace("power_tracking_error_", ""))
-        ax.set_xlabel("error (absoluto si consigna≈0, % si no)")
-    fig.suptitle("Distribución del error de seguimiento de potencia por fuego\n"
-                 "(vista recortada a percentiles 1-99 para legibilidad)")
-    fig.tight_layout()
-    fig.savefig("eda7_distribucion_error_seguimiento.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda7_distribucion_error_seguimiento.png")
-
-
-def eda6_nivel_vs_potencia(df):
-    """Comprobacion de sentido fisico: a mayor nivel comandado, deberia
-    observarse mayor potencia medida en ese mismo fuego."""
-    pares = [(f"nivel_F{i}", f"mean_val__Measured_Power_F{i}") for i in range(1, 6)]
-    pares_validos = [(n, p) for n, p in pares if n in df.columns and p in df.columns]
-
-    fig, axes = plt.subplots(1, len(pares_validos), figsize=(3.5 * len(pares_validos), 4.2), sharey=False)
-    if len(pares_validos) == 1:
-        axes = [axes]
-    for ax, (nivel_col, power_col) in zip(axes, pares_validos):
-        sub = df[[nivel_col, power_col]].dropna()
-        if sub.empty:
+    for col in cols_potencia:
+        if sample[col].notna().sum() == 0:
             continue
-        sub.boxplot(column=power_col, by=nivel_col, ax=ax, grid=False)
-        ax.set_title(f"F{nivel_col[-1]}", fontsize=10)
-        ax.set_xlabel("nivel comandado")
-        ax.set_ylabel("potencia media medida")
-    fig.suptitle("Relación entre nivel de fuego comandado y potencia medida")
-    plt.suptitle("Relación entre nivel de fuego comandado y potencia medida")
-    fig.tight_layout()
-    fig.savefig("eda6_nivel_vs_potencia.png", dpi=150, bbox_inches="tight")
-    print("Guardado eda6_nivel_vs_potencia.png")
+        signo = rng.choice([-1, 1], size=len(sample))
+        factor = 1 + signo * pct * rng.uniform(0.5, 1.5, size=len(sample))
+        sample[col] = sample[col] * factor
+
+    # Recalcular power_tracking_error_Fx para cada fuego presente, con la
+    # potencia medida YA perturbada y la consigna tal cual (no se perturba)
+    error_cols = [c for c in df.columns if c.startswith("power_tracking_error_F")]
+    for col in error_cols:
+        num_fuego = col.replace("power_tracking_error_F", "")
+        col_medido = f"mean_val__Measured_Power_F{num_fuego}"
+        col_consigna = f"mean_val__UI_Target_Power_F{num_fuego}"
+        if col_medido not in sample.columns or col_consigna not in sample.columns:
+            continue
+        medido = sample[col_medido]
+        consigna = sample[col_consigna]
+        absoluto = medido - consigna
+        porcentual = (medido - consigna) / consigna
+        sample[col] = np.where(consigna.abs() < UMBRAL_CONSIGNA_APAGADO, absoluto, porcentual)
+
+    sample["_synthetic"] = 1
+    df = df.copy()
+    df["_synthetic"] = 0
+    return pd.concat([df, sample], ignore_index=True)
+
+
+def qualitative_check(df_eval, scores_dict, nok_mask):
+    """
+    Compara los TESTS NOK reales fiables contra los tests normales del
+    holdout, agregando el score de anomalia POR TEST (maximo y percentil
+    95 de sus subciclos) -- NO subciclo a subciclo.
+
+    Esto es importante: un test etiquetado NOK puede haber fallado por el
+    comportamiento de un UNICO subciclo, no todos. Tratar cada subciclo de
+    un test NOK como "anomalo" por igual seria una etiqueta incorrecta
+    (la mayoria de sus subciclos probablemente sean perfectamente
+    normales). Al agregar por test, el subciclo que realmente disparo el
+    fallo domina el score final (via el maximo/percentil 95), sin
+    penalizar al modelo por el resto de subciclos normales de ese mismo
+    test.
+    """
+    df_eval = df_eval.copy()
+    df_eval["_es_nok"] = nok_mask
+    for name, scores in scores_dict.items():
+        df_eval[f"score_{name}"] = scores
+
+    grp = df_eval.groupby(["SNR", "VIB", "TestName"])
+    score_cols = [f"score_{name}" for name in scores_dict]
+
+    agg_max = grp[score_cols].max()
+    agg_max.columns = [f"{c}__max" for c in agg_max.columns]
+    agg_p95 = grp[score_cols].quantile(0.95)
+    agg_p95.columns = [f"{c}__p95" for c in agg_p95.columns]
+    es_nok_test = grp["_es_nok"].max().astype(bool)
+
+    agg = pd.concat([agg_max, agg_p95, es_nok_test], axis=1).reset_index()
+
+    n_tests_nok = int(agg["_es_nok"].sum())
+    n_tests_total = len(agg)
+    print(f"\n===== Chequeo cualitativo A NIVEL DE TEST ({n_tests_nok} NOK de "
+          f"{n_tests_total} tests, agregando subciclos por maximo/percentil 95) =====")
+
+    if n_tests_nok == 0:
+        print("[AVISO] No hay tests NOK fiables en el conjunto de evaluacion.")
+        return
+
+    resumen = []
+    for name in scores_dict:
+        for agg_tipo in ["max", "p95"]:
+            col = f"score_{name}__{agg_tipo}"
+            percentiles = agg[col].rank(pct=True)
+            resumen.append({
+                "modelo": name,
+                "agregado": agg_tipo,
+                "percentil_medio_NOK": percentiles[agg["_es_nok"]].mean(),
+                "pct_NOK_en_top20%": (percentiles[agg["_es_nok"]] > 0.80).mean(),
+            })
+    print(pd.DataFrame(resumen).to_string(index=False))
+    print("\n(Referencia azar: percentil_medio=0.50, pct_en_top20%=0.20)")
+
+
+def evaluate_synthetic(scores_dict, is_synthetic):
+    results = []
+    for name, scores in scores_dict.items():
+        auc_roc = roc_auc_score(is_synthetic, scores)
+        auc_pr = average_precision_score(is_synthetic, scores)
+        results.append({"modelo": name, "auc_roc_sintetico": auc_roc,
+                         "auc_pr_sintetico": auc_pr})
+    return pd.DataFrame(results).sort_values("auc_pr_sintetico", ascending=False)
+
+
+def fit_final_oneclasssvm(X_fit_raw, cat_cols, num_cols):
+    """
+    Igual que la rama 'OneClassSVM' de compute_scores(), pero devolviendo
+    los objetos ya ajustados (preprocesador, scaler, modelo) en vez de
+    solo los scores, para poder guardarlos en disco y reutilizarlos
+    despues en la app sin tener que reentrenar nada.
+    """
+    prep = build_preprocessor(cat_cols, num_cols)
+    X_fit_t = prep.fit_transform(X_fit_raw)
+
+    scaler = StandardScaler()
+    n_num = len(num_cols)
+    X_fit_num = scaler.fit_transform(X_fit_t[:, :n_num])
+    X_fit_scaled = np.hstack([X_fit_num, X_fit_t[:, n_num:]])
+
+    rng = np.random.RandomState(RANDOM_STATE)
+    X_train = X_fit_scaled
+    if X_train.shape[0] > MAX_SAMPLES_OCSVM:
+        idx = rng.choice(X_train.shape[0], size=MAX_SAMPLES_OCSVM, replace=False)
+        X_train = X_train[idx]
+
+    model = OneClassSVM(nu=CONTAMINATION, kernel="rbf", gamma="scale")
+    model.fit(X_train)
+
+    return prep, scaler, model
 
 
 def main():
-    df = cargar()
-    power_cols, temp_cols, target_cols, error_cols, nivel_cols = resumen_general(df)
+    df, feature_cols, cat_cols, num_cols = load_data()
+    print(f"Dataset: {df.shape[0]} filas (test x subciclo)")
 
-    eda1_balance_clases(df)
-    eda2_distribucion_vib(df)
-    eda3_missing_por_variable(df, power_cols, etiqueta="potencia",
-                               archivo="eda3_missing_por_variable.png")
-    if temp_cols:
-        eda3_missing_por_variable(df, temp_cols, etiqueta="temperatura de cristal",
-                                   archivo="eda3b_missing_temperatura.png")
-    if error_cols:
-        eda3_missing_por_variable(df, error_cols, etiqueta="error de seguimiento",
-                                   archivo="eda3c_missing_error_seguimiento.png")
-
-    eda4_distribucion_niveles(df, nivel_cols)
-    eda5_correlacion(df, power_cols)
-
-    if temp_cols:
-        eda5_correlacion(
-            df, temp_cols, titulo="Correlación entre variables de temperatura de cristal por fuego",
-            archivo="eda5b_correlacion_temperaturas.png",
-            prefijo_quitar="mean_val__Temperature_Glass_",
+    claves_fiables = load_casos_fiables()
+    es_nok = df["Resultado"].astype(str).str.upper().isin(["NOK_FUNC", "NOK_FUNC_EST"])
+    if claves_fiables is not None:
+        es_fiable = df.apply(
+            lambda r: (r["SNR"], r["VIB"], r["TestName"]) in claves_fiables, axis=1
         )
-    if power_cols and error_cols:
-        eda5_correlacion(
-            df, power_cols + error_cols,
-            titulo="Correlación entre potencia medida y error de seguimiento",
-            archivo="eda5c_correlacion_potencia_error.png",
-            prefijo_quitar="mean_val__Measured_Power_",
+    else:
+        es_fiable = pd.Series(False, index=df.index)
+    df["_nok_fiable"] = es_nok & es_fiable
+    print(f"Casos NOK reales fiables: {df['_nok_fiable'].sum()} filas, "
+          f"{df.loc[df['_nok_fiable'], ['SNR','VIB','TestName']].drop_duplicates().shape[0]} tests")
+
+    # --- 1) Entrenamiento SOLO con datos normales (excluye TODO lo NOK,
+    # fiable o no, para no contaminar la definicion de "normal") ---
+    df_ok = df[df["Resultado"].astype(str).str.upper() == "OK"].reset_index(drop=True)
+
+    # --- 2) Split train/holdout dentro de lo normal, para validar
+    # out-of-sample de verdad ---
+    rng = np.random.RandomState(RANDOM_STATE)
+    idx = rng.permutation(len(df_ok))
+    n_holdout = int(len(df_ok) * HOLDOUT_FRACTION)
+    df_holdout_normal = df_ok.iloc[idx[:n_holdout]].reset_index(drop=True)
+    df_train = df_ok.iloc[idx[n_holdout:]].reset_index(drop=True)
+
+    df_nok_fiable = df[df["_nok_fiable"]].reset_index(drop=True)
+
+    print(f"Entrenamiento (solo normal, {1-HOLDOUT_FRACTION:.0%}): {len(df_train)} filas")
+    print(f"Holdout normal (no visto en entrenamiento): {len(df_holdout_normal)} filas")
+
+    # --- Chequeo cualitativo: holdout normal + NOK reales, ambos
+    # out-of-sample (el modelo se entreno solo con df_train) ---
+    df_eval_qual = pd.concat([df_holdout_normal, df_nok_fiable], ignore_index=True)
+    nok_mask_qual = np.zeros(len(df_eval_qual), dtype=bool)
+    nok_mask_qual[len(df_holdout_normal):] = True
+
+    scores_qual = {}
+    for name in MODELOS:
+        print(f"Entrenando {name} (chequeo cualitativo)...")
+        scores_qual[name] = compute_scores(
+            name, df_train[feature_cols], df_eval_qual[feature_cols], cat_cols, num_cols
+        )
+    qualitative_check(df_eval_qual, scores_qual, nok_mask_qual)
+
+    # --- 3) Validacion cuantitativa con sinteticas, out-of-sample de
+    # verdad: se perturban SOLO filas del holdout, nunca del entrenamiento ---
+    print("\nInyectando anomalias sinteticas sobre el holdout (out-of-sample)...")
+    df_holdout_aug = inject_synthetic_anomalies(df_holdout_normal)
+
+    scores_synth = {}
+    for name in MODELOS:
+        print(f"Entrenando {name} (validacion sintetica)...")
+        scores_synth[name] = compute_scores(
+            name, df_train[feature_cols], df_holdout_aug[feature_cols], cat_cols, num_cols
         )
 
-    eda6_nivel_vs_potencia(df)
-    eda7_distribucion_error_seguimiento(df, error_cols)
+    resultados = evaluate_synthetic(scores_synth, df_holdout_aug["_synthetic"].values)
+    print("\n===== TABLA COMPARATIVA (validacion con anomalias sinteticas, out-of-sample) =====")
+    print(resultados.to_string(index=False))
+    resultados.to_csv("comparacion_modelos_anomalias.csv", index=False)
 
-    print("\nEDA completo.")
+    # --- Puntuar TODO el dataset para la app/graficas, reentrenando sobre
+    # TODOS los datos normales disponibles (train+holdout) para
+    # aprovechar el maximo de datos en el modelo final ---
+    print("\nEntrenando modelos finales sobre todo lo normal, puntuando dataset completo...")
+    for name in MODELOS:
+        df[f"anomaly_score__{name}"] = compute_scores(
+            name, df_ok[feature_cols], df[feature_cols], cat_cols, num_cols
+        )
+
+    df.to_parquet("subciclos_con_scores.parquet", index=False)
+    print("\nGuardado subciclos_con_scores.parquet con los scores de cada modelo")
+
+    # --- Definicion operativa de "anomalia": percentil respecto a la
+    # distribucion de scores de los tests NORMALES conocidos (no el
+    # mecanismo interno de cada modelo, que no es consistente entre
+    # ellos: IsolationForest/LOF usan score_samples() directamente, donde
+    # 'contamination' no tiene ningun efecto; solo OneClassSVM usa 'nu' de
+    # forma que si afecta a la frontera aprendida; GMM/PCA/autoencoder no
+    # tienen ningun concepto de contaminacion). El umbral de alerta
+    # (percentil 80) viene de la validacion cualitativa: con
+    # OneClassSVM/p95 capturaba mas de la mitad de los NOK reales
+    # revisando solo el 20% mas anomalo.
+    UMBRAL_ALERTA = 0.80
+    es_ok_mask = df["Resultado"].astype(str).str.upper() == "OK"
+    referencias = {}
+    for name in MODELOS:
+        # la distribucion de referencia es la de los propios tests
+        # normales ya puntuados arriba -- no hace falta reentrenar nada mas
+        referencia = np.sort(df.loc[es_ok_mask, f"anomaly_score__{name}"].values)
+        referencias[name] = referencia
+        percentil = np.searchsorted(referencia, df[f"anomaly_score__{name}"]) / len(referencia)
+        df[f"percentil__{name}"] = percentil
+        df[f"alerta__{name}"] = percentil > UMBRAL_ALERTA
+
+    df.to_parquet("subciclos_con_scores.parquet", index=False)
+    np.savez("referencia_scores_normal.npz", **referencias)
+    print(f"Definicion de alerta: percentil > {UMBRAL_ALERTA} respecto a tests normales.")
+    print("Guardado referencia_scores_normal.npz -- distribucion de referencia fija "
+          "para calcular el percentil de tests nuevos en la app (no recalcular contra "
+          "un grupo que cambie cada vez, o el mismo test cambiaria de percentil sin "
+          "haber cambiado el).")
+
+    # --- Persistir el modelo FINAL elegido (One-Class SVM, agregacion
+    # por maximo) para poder usarlo en la app sin reentrenar nada ---
+    print("\nEntrenando y guardando el modelo final (One-Class SVM) para la app...")
+    prep_final, scaler_final, model_final = fit_final_oneclasssvm(
+        df_ok[feature_cols], cat_cols, num_cols
+    )
+
+    # Referencia a NIVEL DE ENSAYO (maximo por test), no de subciclo suelto.
+    # Importante: comparar "el maximo de N subciclos de un ensayo nuevo"
+    # contra una referencia de SUBCICLOS INDIVIDUALES esta mal calibrado
+    # (el maximo de muchos valores tiende a percentiles altos por pura
+    # estadistica de extremos, aunque el ensayo sea normal). Hay que
+    # comparar "maximo de un ensayo" contra "maximo de otros ensayos".
+    referencia_test_level = (
+        df.loc[es_ok_mask]
+        .groupby(["SNR", "VIB", "TestName"])["anomaly_score__OneClassSVM"]
+        .max()
+        .sort_values()
+        .values
+    )
+
+    joblib.dump({
+        "preprocessor": prep_final,
+        "scaler": scaler_final,
+        "model": model_final,
+        "cat_cols": cat_cols,
+        "num_cols": num_cols,
+        "feature_cols": feature_cols,
+        "referencia_scores": referencias["OneClassSVM"],           # nivel subciclo (para la tabla de detalle)
+        "referencia_scores_test": referencia_test_level,           # nivel ensayo (para el veredicto global)
+        "umbral_alerta": UMBRAL_ALERTA,
+    }, "modelo_final_oneclasssvm.joblib")
+    print("Guardado modelo_final_oneclasssvm.joblib -- listo para usar en la app "
+          "sin reentrenar (incluye preprocesador, scaler, modelo, columnas "
+          "esperadas y distribucion de referencia).")
+
+    # --- Anomalias sinteticas puntuadas por el modelo FINAL (entrenado
+    # con todos los datos normales), para poder compararlas como una
+    # tercera categoria junto a "Resto" y "NOK real" en las graficas.
+    # Cada sintetica recibe un SNR/TestName UNICO: asi, cuando las
+    # graficas agreguen por (SNR,VIB,TestName), cada una forma su propio
+    # grupo de una sola fila y su valor agregado (max/p95) es
+    # simplemente su propio score, sin distorsion.
+    print("\nGenerando anomalias sinteticas puntuadas por el modelo final...")
+    df_sint_aug = inject_synthetic_anomalies(df_ok)
+    df_sint = df_sint_aug[df_sint_aug["_synthetic"] == 1].reset_index(drop=True)
+    df_sint["SNR"] = [f"SINT_{i}" for i in range(len(df_sint))]
+    df_sint["TestName"] = [f"SINT_TEST_{i}" for i in range(len(df_sint))]
+    df_sint["Resultado"] = "NOK_SINTETICO"
+
+    for name in MODELOS:
+        df_sint[f"anomaly_score__{name}"] = compute_scores(
+            name, df_ok[feature_cols], df_sint[feature_cols], cat_cols, num_cols
+        )
+
+    df_sint.to_parquet("sinteticos_con_scores.parquet", index=False)
+    print("Guardado sinteticos_con_scores.parquet")
 
 
 if __name__ == "__main__":
