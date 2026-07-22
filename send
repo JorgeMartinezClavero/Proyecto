@@ -4,6 +4,18 @@ comprobar si el % de TESTS NOK reales capturados en el top 20% mas
 anomalo es estadisticamente distinguible del azar (20%), dado que solo
 se dispone de un numero pequeño de casos NOK reales conocidos.
 
+IMPORTANTE: la referencia de "normal" usada para calcular el percentil
+de cada test es EXCLUSIVAMENTE el holdout (el 20% de ensayos normales
+que el modelo nunca vio durante el entrenamiento) -- exactamente el
+mismo criterio que usa qualitative_check() en 05_train_anomaly_models.py.
+No se usa el dataset completo (que mezclaria tests usados para entrenar,
+donde los modelos de reconstruccion como PCA tienen artificialmente
+poco error) porque distorsionaria la comparacion.
+
+Para reproducir el MISMO holdout que 05, se replica aqui exactamente la
+misma logica de particion (mismo RANDOM_STATE, mismo orden de filas a
+partir de subciclos_con_scores.parquet).
+
 Hipotesis nula: el modelo no aporta nada, y la probabilidad de que un
 NOK real caiga en el 20% mas anomalo es simplemente 0.20 (como si se
 eligiera al azar). Se contrasta contra la alternativa de que la
@@ -11,23 +23,67 @@ probabilidad real es MAYOR que 0.20 (test unilateral, porque solo nos
 interesa demostrar que el modelo ayuda, no que perjudica).
 
 Requiere:
-    pip install pandas scipy
+    pip install pandas numpy scipy
 
 Uso:
     python 07_test_significancia.py
 """
 
-import importlib.util
+import numpy as np
 import pandas as pd
 from scipy.stats import binomtest
 
-UMBRAL = 0.80  # top 20% mas anomalo
+SCORES_PARQUET = "subciclos_con_scores.parquet"
+CANDIDATOS_CSV = "candidatos_subciclo_alto.csv"
 
-# Cargamos 06_generar_graficas.py como modulo (su nombre empieza por un
-# numero, por eso no se puede hacer un "import" normal)
-spec = importlib.util.spec_from_file_location("graficas", "06_generar_graficas.py")
-graficas = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(graficas)
+RANDOM_STATE = 42
+HOLDOUT_FRACTION = 0.20  # debe coincidir con 05_train_anomaly_models.py
+UMBRAL = 0.80            # top 20% mas anomalo
+
+
+def cargar_y_reconstruir_holdout():
+    """Replica EXACTAMENTE la particion train/holdout de
+    05_train_anomaly_models.py, para evaluar contra la misma referencia
+    out-of-sample (no contra el dataset completo, que mezclaria tests
+    usados para entrenar)."""
+    df = pd.read_parquet(SCORES_PARQUET)
+
+    candidatos = pd.read_csv(
+        CANDIDATOS_CSV, dtype={"SNR": str, "VIB": str, "TestName": str, "FD": str}
+    )
+    fiables = candidatos[candidatos["tiene_datos"].astype(str).str.lower() == "true"]
+    claves_fiables = set(zip(fiables["SNR"], fiables["VIB"], fiables["TestName"]))
+
+    es_nok = df["Resultado"].astype(str).str.upper().isin(["NOK_FUNC", "NOK_FUNC_EST"])
+    es_fiable = df.apply(lambda r: (r["SNR"], r["VIB"], r["TestName"]) in claves_fiables, axis=1)
+    df["_nok_fiable"] = es_nok & es_fiable
+
+    df_ok = df[df["Resultado"].astype(str).str.upper() == "OK"].reset_index(drop=True)
+    df_nok_fiable = df[df["_nok_fiable"]].reset_index(drop=True)
+
+    rng = np.random.RandomState(RANDOM_STATE)
+    idx = rng.permutation(len(df_ok))
+    n_holdout = int(len(df_ok) * HOLDOUT_FRACTION)
+    df_holdout_normal = df_ok.iloc[idx[:n_holdout]].reset_index(drop=True)
+
+    print(f"Holdout normal reconstruido: {len(df_holdout_normal)} filas "
+          f"(debe coincidir con lo que imprimio 05_train_anomaly_models.py)")
+
+    df_eval = pd.concat([df_holdout_normal, df_nok_fiable], ignore_index=True)
+    nok_mask = np.zeros(len(df_eval), dtype=bool)
+    nok_mask[len(df_holdout_normal):] = True
+    return df_eval, nok_mask
+
+
+def agregar_a_nivel_test(df_eval, agg_tipo):
+    score_cols = [c for c in df_eval.columns if c.startswith("anomaly_score__")]
+    grp = df_eval.groupby(["SNR", "VIB", "TestName"])
+    if agg_tipo == "max":
+        agg = grp[score_cols].max()
+    else:
+        agg = grp[score_cols].quantile(0.95)
+    es_nok_test = grp["_nok_fiable"].max().astype(bool)
+    return agg.join(es_nok_test).reset_index()
 
 
 def significancia(agg, agg_tipo):
@@ -58,11 +114,12 @@ def significancia(agg, agg_tipo):
 
 
 def main():
-    df = graficas.cargar_datos()
+    df_eval, nok_mask = cargar_y_reconstruir_holdout()
+    df_eval["_nok_fiable"] = nok_mask
 
     resultados = []
     for agg_tipo in ["max", "p95"]:
-        agg = graficas.agregar_a_nivel_test(df, agg_tipo=agg_tipo)
+        agg = agregar_a_nivel_test(df_eval, agg_tipo=agg_tipo)
         resultados.append(significancia(agg, agg_tipo))
 
     tabla = pd.concat(resultados, ignore_index=True)
