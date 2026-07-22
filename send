@@ -1,23 +1,10 @@
 """
-Diagnostico: por que la app marca (casi) todo como alerta.
-
-Compara, para varios ensayos OK ANTIGUOS (presentes en el dataset de
-entrenamiento), el score que calcula la app en vivo contra el score ya
-guardado en subciclos_con_scores.parquet para ese mismo ensayo.
-
-  - Si los scores COINCIDEN (diferencias ~0): la construccion de
-    variables de la app es correcta, y el problema es el sesgo
-    dentro/fuera de muestra de la referencia (hipotesis B) -> habra que
-    reconstruir la referencia con validacion cruzada.
-  - Si los scores NO COINCIDEN: hay un desajuste en la construccion de
-    variables de la app (hipotesis A) -> comparar columnas para
-    localizarlo.
-
-Requiere (misma carpeta): modelo_final_pca.joblib, subciclos_con_scores.parquet,
-04_build_subcycle_dataset.py, app_tab_anomalias.py, acceso a la BBDD.
+Segunda fase del diagnostico: localizar QUE variables difieren entre lo
+que construye la app y lo que se uso para entrenar (guardado en
+subciclos_con_scores.parquet), para un ensayo concreto.
 
 Uso:
-    python 13_diagnostico_app.py
+    python 14_diagnostico_variables.py
 """
 
 import importlib.util
@@ -25,8 +12,10 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine
 
-N_TESTS = 5
-RANDOM_STATE = 7
+# Uno de los ensayos que SI se pudo comparar en 13_diagnostico_app.py
+TEST_SNR = "000222"
+TEST_VIB = "PVQ61CHB1E"
+TEST_NAME = "CC_IPR_IH_4I_MT+_---_1_7"
 
 spec = importlib.util.spec_from_file_location("app_mod", "app_tab_anomalias.py")
 app_mod = importlib.util.module_from_spec(spec)
@@ -40,67 +29,71 @@ def norm_snr(s):
 
 def main():
     bundle = app_mod.cargar_modelo()
-    df_hist = pd.read_parquet("subciclos_con_scores.parquet")
-    score_col = [c for c in df_hist.columns if c.startswith("anomaly_score__PCA")][0]
+    feature_cols = bundle["feature_cols"]
 
-    ok_tests = (df_hist[df_hist["Resultado"].astype(str).str.upper() == "OK"]
-                [["SNR", "VIB", "TestName"]].drop_duplicates()
-                .sample(n=N_TESTS, random_state=RANDOM_STATE))
+    df_hist = pd.read_parquet("subciclos_con_scores.parquet")
+    hist = df_hist[(df_hist["SNR"].apply(norm_snr) == norm_snr(TEST_SNR))
+                   & (df_hist["VIB"] == TEST_VIB)
+                   & (df_hist["TestName"] == TEST_NAME)]
+    print(f"Filas del ensayo en el parquet: {len(hist)}")
 
     engine = create_engine(build_ds.CONN_STR)
     engine_qitdb = create_engine(build_ds.CONN_STR_QITDB)
 
-    print(f"Percentiles de la referencia guardada: n={len(bundle['referencia_scores_test'])}, "
-          f"min={bundle['referencia_scores_test'].min():.5f}, "
-          f"p50={np.median(bundle['referencia_scores_test']):.5f}, "
-          f"max={bundle['referencia_scores_test'].max():.5f}\n")
+    q = """
+        SELECT SNR, FD, VIB, Ciclo AS TestName, FechaInicio, FechaFin
+        FROM QIT_DB.dbo.Ensayos
+        WHERE Area='IPR' AND VIB = ? AND Ciclo = ?
+    """
+    info = pd.read_sql(q, engine_qitdb, params=(TEST_VIB, TEST_NAME),
+                       dtype={"SNR": str, "FD": str})
+    info = info[info["SNR"].apply(norm_snr) == norm_snr(TEST_SNR)]
+    fila = info.iloc[0]
 
-    for _, t in ok_tests.iterrows():
-        q = """
-            SELECT SNR, FD, VIB, Ciclo AS TestName, FechaInicio, FechaFin
-            FROM QIT_DB.dbo.Ensayos
-            WHERE Area='IPR' AND VIB = ? AND Ciclo = ?
-        """
-        info = pd.read_sql(q, engine_qitdb, params=(t["VIB"], t["TestName"]),
-                           dtype={"SNR": str, "FD": str})
-        # filtrar por el SNR concreto DESPUES de traer todas las ejecuciones
-        # de ese VIB+Test (comparando sin ceros a la izquierda)
-        info = info[info["SNR"].apply(norm_snr) == norm_snr(t["SNR"])]
-        if info.empty:
-            print(f"[{t['SNR']}/{t['VIB']}/{t['TestName']}] no encontrado en Ensayos, salto")
+    feats = app_mod.construir_features_test(
+        engine, engine_qitdb, fila["SNR"], fila["FD"], TEST_VIB,
+        TEST_NAME, fila["FechaInicio"], fila["FechaFin"])
+    print(f"Filas construidas por la app: {len(feats)}")
+
+    m = feats.merge(hist, on=["Subcycle", "Repetition"],
+                    suffixes=("_app", "_hist"), how="inner")
+    print(f"Subciclos comunes: {len(m)}\n")
+
+    resultados = []
+    for col in feature_cols:
+        ca, ch = f"{col}_app", f"{col}_hist"
+        if ca not in m.columns or ch not in m.columns:
+            # la columna no tiene sufijo si solo existia en uno de los dos lados
+            estado = []
+            if col in feats.columns: estado.append("solo app")
+            if col in hist.columns: estado.append("solo parquet")
+            if col not in feats.columns and col not in hist.columns:
+                estado.append("en ninguno (NaN por imputacion en ambos)")
+            resultados.append((col, np.nan, np.nan, np.nan, " / ".join(estado)))
             continue
-        fila = info.iloc[0]
-
-        feats = app_mod.construir_features_test(
-            engine, engine_qitdb, fila["SNR"], fila["FD"], t["VIB"],
-            t["TestName"], fila["FechaInicio"], fila["FechaFin"])
-        if feats is None or feats.empty:
-            print(f"[{t['SNR']}/{t['VIB']}/{t['TestName']}] sin datos de sensores, salto")
+        va, vh = m[ca], m[ch]
+        if not (np.issubdtype(va.dtype, np.number) and np.issubdtype(vh.dtype, np.number)):
+            iguales = (va.astype(str) == vh.astype(str)).all()
+            resultados.append((col, np.nan, np.nan, np.nan,
+                               "categorica igual" if iguales else "CATEGORICA DISTINTA"))
             continue
+        ambos = va.notna() & vh.notna()
+        solo_app_nan = (va.isna() & vh.notna()).sum()
+        solo_hist_nan = (vh.isna() & va.notna()).sum()
+        diff = (va[ambos] - vh[ambos]).abs()
+        max_d = diff.max() if len(diff) else 0.0
+        resultados.append((col, max_d,
+                           va[ambos].mean() if ambos.any() else np.nan,
+                           vh[ambos].mean() if ambos.any() else np.nan,
+                           f"NaN solo en app: {solo_app_nan}, solo en parquet: {solo_hist_nan}"))
 
-        scores, _, percentil_test = app_mod.puntuar(feats, bundle)
-        feats["score_app"] = scores
-
-        hist = df_hist[(df_hist["SNR"].apply(norm_snr) == norm_snr(t["SNR"]))
-                       & (df_hist["VIB"] == t["VIB"])
-                       & (df_hist["TestName"] == t["TestName"])]
-        m = feats.merge(hist[["Subcycle", "Repetition", score_col]],
-                        on=["Subcycle", "Repetition"], how="inner")
-        if m.empty:
-            print(f"[{t['SNR']}/{t['VIB']}/{t['TestName']}] sin subciclos comunes para comparar")
-            continue
-
-        diff = (m["score_app"] - m[score_col]).abs()
-        print(f"[{t['SNR']}/{t['VIB']}/{t['TestName']}] subciclos comparados: {len(m)}")
-        print(f"    score guardado (max): {m[score_col].max():.5f}   "
-              f"score app (max): {m['score_app'].max():.5f}")
-        print(f"    diferencia absoluta por subciclo: media={diff.mean():.6f}  max={diff.max():.6f}")
-        print(f"    percentil del ensayo segun la app: {percentil_test:.1%}  "
-              f"(es un ensayo OK antiguo: deberia salir mayoritariamente verde)\n")
-
-    print("Interpretacion: diferencias ~0 pero percentiles altos -> hipotesis B "
-          "(referencia dentro-de-muestra). Diferencias grandes -> hipotesis A "
-          "(desajuste de variables en la app).")
+    tabla = pd.DataFrame(resultados, columns=["columna", "max_diff", "media_app", "media_parquet", "nota"])
+    tabla = tabla.sort_values("max_diff", ascending=False, na_position="last")
+    pd.set_option("display.width", 200)
+    print("===== Top 20 columnas con mayor discrepancia =====")
+    print(tabla.head(20).to_string(index=False))
+    tabla.to_csv("diagnostico_variables.csv", index=False)
+    print("\nGuardado diagnostico_variables.csv (todas las columnas)")
 
 
 if __name__ == "__main__":
