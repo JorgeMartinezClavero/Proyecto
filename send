@@ -1,100 +1,331 @@
 """
-Segunda fase del diagnostico: localizar QUE variables difieren entre lo
-que construye la app y lo que se uso para entrenar (guardado en
-subciclos_con_scores.parquet), para un ensayo concreto.
+Pestaña Streamlit: detección de anomalías para un ensayo IPR seleccionado.
+
+Filtra un ensayo (VIB -> TestName -> SNR), y al pulsar "Analizar anomalías"
+extrae de SQL Server las mismas variables agregadas por subciclo que se
+usaron para entrenar el modelo (04_build_subcycle_dataset.py), las puntúa
+con el modelo ya entrenado (modelo_final_oneclasssvm.joblib) y muestra:
+  - un semaforo con el veredicto global del ensayo (percentil del peor
+    subciclo respecto a la distribucion de ensayos normales)
+  - una tabla con el score/percentil de cada subciclo, para localizar
+    en cual concreto se dispara la alerta
+
+Requiere en la misma carpeta:
+    modelo_final_oneclasssvm.joblib  (generado por 05_train_anomaly_models.py)
+    04_build_subcycle_dataset.py     (se reutiliza su logica de extraccion)
+
+Requiere:
+    pip install streamlit pandas numpy scikit-learn joblib pyodbc sqlalchemy
 
 Uso:
-    python 14_diagnostico_variables.py
+    streamlit run app_tab_anomalias.py
 """
 
 import importlib.util
 import numpy as np
 import pandas as pd
+import joblib
+import streamlit as st
+import matplotlib.pyplot as plt
 from sqlalchemy import create_engine
 
-# Uno de los ensayos que SI se pudo comparar en 13_diagnostico_app.py
-TEST_SNR = "000222"
-TEST_VIB = "PVQ61CHB1E"
-TEST_NAME = "CC_IPR_IH_4I_MT+_---_1_7"
+# --- Reutilizamos la logica ya validada de 04_build_subcycle_dataset.py,
+# en vez de duplicarla (mismo canonizado de variables, mismo parseo de
+# niveles de fuego, misma query de agregacion) ---
+spec = importlib.util.spec_from_file_location("build_ds", "04_build_subcycle_dataset.py")
+build_ds = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_ds)
 
-spec = importlib.util.spec_from_file_location("app_mod", "app_tab_anomalias.py")
-app_mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(app_mod)
-build_ds = app_mod.build_ds
+MODELO_PATH = "modelo_final_pca.joblib"
 
-
-def norm_snr(s):
-    return str(s).lstrip("0")
+UMBRAL_VERDE = 0.85  # top 15% marcado (ajustado tras analisis recall/precision, ver 11_explorar_umbral.py)
+UMBRAL_AMBAR = 0.95
 
 
-def main():
-    bundle = app_mod.cargar_modelo()
-    feature_cols = bundle["feature_cols"]
+@st.cache_resource
+def cargar_modelo():
+    return joblib.load(MODELO_PATH)
 
-    df_hist = pd.read_parquet("subciclos_con_scores.parquet")
-    hist = df_hist[(df_hist["SNR"].apply(norm_snr) == norm_snr(TEST_SNR))
-                   & (df_hist["VIB"] == TEST_VIB)
-                   & (df_hist["TestName"] == TEST_NAME)]
-    print(f"Filas del ensayo en el parquet: {len(hist)}")
 
-    engine = create_engine(build_ds.CONN_STR)
-    engine_qitdb = create_engine(build_ds.CONN_STR_QITDB)
+@st.cache_resource
+def conexiones():
+    return create_engine(build_ds.CONN_STR), create_engine(build_ds.CONN_STR_QITDB)
 
-    q = """
-        SELECT SNR, FD, VIB, Ciclo AS TestName, FechaInicio, FechaFin
-        FROM QIT_DB.dbo.Ensayos
-        WHERE Area='IPR' AND VIB = ? AND Ciclo = ?
+
+@st.cache_data(ttl=600)
+def opciones_vib(_engine_qitdb):
+    q = "SELECT DISTINCT VIB FROM QIT_DB.dbo.Ensayos WHERE Area='IPR' ORDER BY VIB"
+    return pd.read_sql(q, _engine_qitdb)["VIB"].tolist()
+
+
+@st.cache_data(ttl=600)
+def opciones_test(_engine_qitdb, vib):
+    q = f"""
+        SELECT DISTINCT Ciclo AS TestName FROM QIT_DB.dbo.Ensayos
+        WHERE Area='IPR' AND VIB = '{vib}'
+        ORDER BY Ciclo
     """
-    info = pd.read_sql(q, engine_qitdb, params=(TEST_VIB, TEST_NAME),
-                       dtype={"SNR": str, "FD": str})
-    info = info[info["SNR"].apply(norm_snr) == norm_snr(TEST_SNR)]
-    fila = info.iloc[0]
+    return pd.read_sql(q, _engine_qitdb)["TestName"].tolist()
 
-    feats = app_mod.construir_features_test(
-        engine, engine_qitdb, fila["SNR"], fila["FD"], TEST_VIB,
-        TEST_NAME, fila["FechaInicio"], fila["FechaFin"])
-    print(f"Filas construidas por la app: {len(feats)}")
 
-    m = feats.merge(hist, on=["Subcycle", "Repetition"],
-                    suffixes=("_app", "_hist"), how="inner")
-    print(f"Subciclos comunes: {len(m)}\n")
+@st.cache_data(ttl=600)
+def opciones_snr(_engine_qitdb, vib, test_name):
+    q = f"""
+        SELECT SNR, FD, FechaInicio, FechaFin
+        FROM QIT_DB.dbo.Ensayos
+        WHERE Area='IPR' AND VIB = '{vib}' AND Ciclo = '{test_name}'
+        ORDER BY FechaInicio DESC
+    """
+    return pd.read_sql(q, _engine_qitdb, dtype={"SNR": str, "FD": str})
 
-    resultados = []
+
+@st.cache_data(ttl=300)
+def opciones_ultimos_tests(_engine_qitdb, n=30):
+    q = f"""
+        SELECT TOP {n} VIB, Ciclo AS TestName, SNR, FD, FechaInicio, FechaFin, Resultado
+        FROM QIT_DB.dbo.Ensayos
+        WHERE Area='IPR'
+        ORDER BY FechaInicio DESC
+    """
+    return pd.read_sql(q, _engine_qitdb, dtype={"SNR": str, "FD": str})
+
+
+def construir_features_test(engine, engine_qitdb, snr, fd, vib, test_name, fecha_inicio, fecha_fin):
+    """Reconstruye, para UN ensayo, exactamente el mismo dataframe de
+    features por subciclo que 04_build_subcycle_dataset.py genera para
+    todo el histórico -- misma agregacion, mismo canonizado, mismos
+    niveles de fuego."""
+    query = build_ds.build_query()
+    fecha_fin_efectiva = fecha_fin if pd.notna(fecha_fin) else pd.Timestamp.now()
+
+    params = (str(snr).zfill(10), str(fd).zfill(10), vib, test_name,
+              pd.to_datetime(fecha_inicio), pd.to_datetime(fecha_fin_efectiva))
+    df = pd.read_sql(query, engine, params=params)
+    if df.empty:
+        return None
+
+    df["var_canon"] = df["Variable_Name"].apply(build_ds.canonical_name)
+
+    df_niveles = build_ds.fetch_subcycle_definitions(engine_qitdb, [test_name])
+    nivel_cols = [c for c in df_niveles.columns if c.startswith("nivel_F")]
+    niveles_test = df_niveles[df_niveles["TestName"] == test_name]
+
+    filas = []
+    for (subciclo, repeticion), grupo in df.groupby(["Subcycle", "Repetition"]):
+        fila_niveles = niveles_test[niveles_test["Subcycle"] == subciclo]
+        fila = {col: (fila_niveles.iloc[0][col] if not fila_niveles.empty else np.nan)
+                for col in nivel_cols}
+        fila["VIB"] = vib
+        fila["Subcycle"] = subciclo
+        fila["Repetition"] = repeticion
+        for _, r in grupo.iterrows():
+            for stat in build_ds.STATS:
+                # Temperature_Glass se mantiene en la unidad interna del
+                # sensor (decimas de grado), igual que en el dataset con el
+                # que se entreno el modelo. La escala es irrelevante para el
+                # modelo (el StandardScaler la normaliza), lo critico es que
+                # app y entrenamiento usen LA MISMA.
+                fila[f"{stat}__{r['var_canon']}"] = r[stat]
+
+        # Misma variable derivada que 04: error de seguimiento de potencia
+        # por fuego (hibrido: % si hay consigna real, absoluto si ~0)
+        fuegos_presentes = {c.split("_F")[-1] for c in fila
+                             if c.startswith("mean_val__Measured_Power_F")}
+        for num_fuego in fuegos_presentes:
+            medido = fila.get(f"mean_val__Measured_Power_F{num_fuego}")
+            consigna = fila.get(f"mean_val__UI_Target_Power_F{num_fuego}")
+            if medido is None or consigna is None or pd.isna(medido) or pd.isna(consigna):
+                continue
+            if abs(consigna) < build_ds.UMBRAL_CONSIGNA_APAGADO:
+                error = medido - consigna
+            else:
+                error = (medido - consigna) / consigna
+            fila[f"power_tracking_error_F{num_fuego}"] = error
+
+        filas.append(fila)
+
+    resultado = pd.DataFrame(filas)
+    if nivel_cols:
+        build_ds.coerce_nivel_columns(resultado, nivel_cols)
+    return resultado
+
+
+def puntuar(features_df, modelo_bundle):
+    """Aplica el preprocesador + scaler + modelo YA AJUSTADOS (nunca se
+    reentrena nada aqui) y devuelve:
+      - el score/percentil de CADA subciclo (respecto a otros subciclos
+        sueltos -- util para el detalle, no para el veredicto global)
+      - el percentil del ENSAYO completo (el maximo de sus scores,
+        comparado con el maximo de otros ensayos normales -- esta es la
+        comparacion correctamente calibrada, ver nota en 05_train_anomaly_models.py)
+    """
+    feature_cols = modelo_bundle["feature_cols"]
+    num_cols = modelo_bundle["num_cols"]
+
     for col in feature_cols:
-        ca, ch = f"{col}_app", f"{col}_hist"
-        if ca not in m.columns or ch not in m.columns:
-            # la columna no tiene sufijo si solo existia en uno de los dos lados
-            estado = []
-            if col in feats.columns: estado.append("solo app")
-            if col in hist.columns: estado.append("solo parquet")
-            if col not in feats.columns and col not in hist.columns:
-                estado.append("en ninguno (NaN por imputacion en ambos)")
-            resultados.append((col, np.nan, np.nan, np.nan, " / ".join(estado)))
-            continue
-        va, vh = m[ca], m[ch]
-        if not (np.issubdtype(va.dtype, np.number) and np.issubdtype(vh.dtype, np.number)):
-            iguales = (va.astype(str) == vh.astype(str)).all()
-            resultados.append((col, np.nan, np.nan, np.nan,
-                               "categorica igual" if iguales else "CATEGORICA DISTINTA"))
-            continue
-        ambos = va.notna() & vh.notna()
-        solo_app_nan = (va.isna() & vh.notna()).sum()
-        solo_hist_nan = (vh.isna() & va.notna()).sum()
-        diff = (va[ambos] - vh[ambos]).abs()
-        max_d = diff.max() if len(diff) else 0.0
-        resultados.append((col, max_d,
-                           va[ambos].mean() if ambos.any() else np.nan,
-                           vh[ambos].mean() if ambos.any() else np.nan,
-                           f"NaN solo en app: {solo_app_nan}, solo en parquet: {solo_hist_nan}"))
+        if col not in features_df.columns:
+            features_df[col] = np.nan
+    X = features_df[feature_cols]
 
-    tabla = pd.DataFrame(resultados, columns=["columna", "max_diff", "media_app", "media_parquet", "nota"])
-    tabla = tabla.sort_values("max_diff", ascending=False, na_position="last")
-    pd.set_option("display.width", 200)
-    print("===== Top 20 columnas con mayor discrepancia =====")
-    print(tabla.head(20).to_string(index=False))
-    tabla.to_csv("diagnostico_variables.csv", index=False)
-    print("\nGuardado diagnostico_variables.csv (todas las columnas)")
+    X_t = modelo_bundle["preprocessor"].transform(X)
+    X_num = modelo_bundle["scaler"].transform(X_t[:, :len(num_cols)])
+    X_scaled = np.hstack([X_num, X_t[:, len(num_cols):]])
+
+    tipo_modelo = modelo_bundle.get("tipo_modelo", "svm")
+    if tipo_modelo == "pca":
+        # Score = error de reconstruccion (PCA): cuanto peor se reconstruye
+        # una fila a partir de sus componentes principales, mas anomala es.
+        X_rec = modelo_bundle["model"].inverse_transform(
+            modelo_bundle["model"].transform(X_scaled)
+        )
+        scores = np.mean((X_scaled - X_rec) ** 2, axis=1)
+    else:
+        scores = -modelo_bundle["model"].decision_function(X_scaled)
+
+    referencia_subciclo = modelo_bundle["referencia_scores"]
+    percentiles_subciclo = np.searchsorted(referencia_subciclo, scores) / len(referencia_subciclo)
+
+    referencia_test = modelo_bundle["referencia_scores_test"]
+    score_test = scores.max()
+    percentil_test = np.searchsorted(referencia_test, score_test) / len(referencia_test)
+
+    return scores, percentiles_subciclo, percentil_test
+
+
+def color_semaforo(percentil):
+    if percentil <= UMBRAL_VERDE:
+        return "🟢", "Normal"
+    elif percentil <= UMBRAL_AMBAR:
+        return "🟡", "Atención"
+    else:
+        return "🔴", "Alerta"
+
+
+def graficar_evolucion_subciclos(features_df):
+    """Grafica el percentil de anomalia a lo largo del ensayo (ordenado
+    por repeticion y subciclo), coloreando los puntos segun el semaforo
+    -- version simplificada, para un unico ensayo, de la Figura 4 de la
+    memoria (evolucion del score por subciclo)."""
+    datos = features_df.sort_values(["Repetition", "Subcycle"]).reset_index(drop=True)
+    x = range(len(datos))
+    colores = {
+        "Normal": "#55A868",
+        "Atención": "#DDB13A",
+        "Alerta": "#C44E52",
+    }
+    etiquetas = [color_semaforo(p)[1] for p in datos["percentil"]]
+
+    fig, ax = plt.subplots(figsize=(9, 3.2))
+    ax.plot(x, datos["percentil"], color="lightgray", linewidth=1, zorder=1)
+    for cat, color in colores.items():
+        mask = [e == cat for e in etiquetas]
+        ax.scatter(
+            [xi for xi, m in zip(x, mask) if m],
+            datos.loc[mask, "percentil"],
+            color=color, label=cat, zorder=2, s=35,
+        )
+    ax.axhline(UMBRAL_VERDE, color="#DDB13A", linestyle="--", linewidth=1)
+    ax.axhline(UMBRAL_AMBAR, color="#C44E52", linestyle="--", linewidth=1)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(datos["Subcycle"], rotation=90, fontsize=7)
+    ax.set_xlabel("Subciclo (orden de ejecución)")
+    ax.set_ylabel("Percentil de anomalía")
+    ax.set_ylim(0, 1.05)
+    ax.legend(loc="upper left", fontsize=8, ncol=3)
+    fig.tight_layout()
+    return fig
+
+
+def render_tab_anomalias():
+    st.subheader("Detección de anomalías (IPR)")
+
+    modelo_bundle = cargar_modelo()
+    engine, engine_qitdb = conexiones()
+
+    st.markdown("#### Últimos ensayos")
+    n_mostrar = st.slider("Nº de ensayos a mostrar", min_value=20, max_value=300,
+                           value=100, step=20)
+    ultimos = opciones_ultimos_tests(engine_qitdb, n=n_mostrar)
+    seleccion = st.dataframe(
+        ultimos[["VIB", "TestName", "SNR", "FechaInicio", "Resultado"]],
+        use_container_width=True, hide_index=True,
+        on_select="rerun", selection_mode="single-row", key="tabla_ultimos",
+    )
+
+    fila = None
+    filas_seleccionadas = seleccion.selection.rows if seleccion is not None else []
+    if filas_seleccionadas:
+        fila = ultimos.iloc[filas_seleccionadas[0]]
+        vib, test_name = fila["VIB"], fila["TestName"]
+        st.caption(f"Ensayo seleccionado de la tabla: **{vib} / {test_name} / SNR {fila['SNR']}**")
+    else:
+        st.markdown("#### O bien, filtrar manualmente")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            vib = st.selectbox("Modelo de producto (VIB)", opciones_vib(engine_qitdb))
+        with col2:
+            test_name = st.selectbox("Test", opciones_test(engine_qitdb, vib) if vib else [])
+        with col3:
+            snr_df = opciones_snr(engine_qitdb, vib, test_name) if (vib and test_name) else pd.DataFrame()
+            etiquetas_snr = [
+                f"{row.SNR}  ({pd.to_datetime(row.FechaInicio).date()})"
+                for row in snr_df.itertuples()
+            ] if not snr_df.empty else []
+            snr_elegido = st.selectbox("SNR", etiquetas_snr)
+        if snr_elegido:
+            fila = snr_df.iloc[etiquetas_snr.index(snr_elegido)]
+
+    if fila is None:
+        st.caption("Selecciona un ensayo en la tabla de arriba, o usa los filtros "
+                   "manuales. El análisis se lanza automáticamente al seleccionar; "
+                   "la consulta a la base de datos puede tardar unos segundos.")
+        return
+
+    with st.spinner("Consultando la base de datos y puntuando el ensayo..."):
+        features_df = construir_features_test(
+            engine, engine_qitdb,
+            fila["SNR"], fila["FD"], vib, test_name,
+            fila["FechaInicio"], fila["FechaFin"],
+        )
+
+    if features_df is None or features_df.empty:
+        st.warning("No se han encontrado datos de sensores para este ensayo en el "
+                   "rango de fechas disponible.")
+        return
+
+    scores, percentiles_subciclo, percentil_test = puntuar(features_df, modelo_bundle)
+    features_df["score_anomalia"] = scores
+    features_df["percentil"] = percentiles_subciclo
+
+    # veredicto del ensayo: percentil de su score maximo frente a la
+    # referencia de ensayos completos (NO el maximo de los percentiles de
+    # subciclo, que sale sesgado hacia arriba por tener muchos subciclos)
+    idx_peor = int(np.argmax(scores))
+    subciclo_peor = features_df.iloc[idx_peor]["Subcycle"]
+    icono, etiqueta = color_semaforo(percentil_test)
+
+    st.markdown(f"## {icono}  Resultado: **{etiqueta}**")
+    st.metric("Percentil de anomalía del ensayo", f"{percentil_test:.0%}")
+    st.caption(f"Subciclo más anómalo: **{subciclo_peor}** — umbral de alerta: percentil > "
+               f"{UMBRAL_AMBAR:.0%}; atención entre {UMBRAL_VERDE:.0%} y {UMBRAL_AMBAR:.0%}. "
+               f"(El percentil de cada subciclo individual en la tabla de abajo es "
+               f"orientativo, relativo a otros subciclos sueltos; el veredicto global "
+               f"usa la comparación correcta entre ensayos completos.)")
+
+    st.markdown("### Evolución por subciclo")
+    st.pyplot(graficar_evolucion_subciclos(features_df))
+
+    st.markdown("### Detalle por subciclo")
+    tabla = features_df[["Subcycle", "Repetition", "score_anomalia", "percentil"]].copy()
+    tabla["semáforo"] = tabla["percentil"].apply(lambda p: color_semaforo(p)[0])
+    tabla = tabla.sort_values("percentil", ascending=False).reset_index(drop=True)
+    tabla["percentil"] = tabla["percentil"].map(lambda p: f"{p:.0%}")
+    st.dataframe(
+        tabla[["semáforo", "Subcycle", "Repetition", "score_anomalia", "percentil"]],
+        use_container_width=True, hide_index=True,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    st.set_page_config(page_title="Detección de anomalías", layout="wide")
+    render_tab_anomalias()
