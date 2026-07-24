@@ -196,9 +196,9 @@ def color_semaforo(percentil):
     if percentil <= UMBRAL_VERDE:
         return "🟢", "Normal"
     elif percentil <= UMBRAL_AMBAR:
-        return "🟡", "Atención"
+        return "🟡", "Attention"
     else:
-        return "🔴", "Alerta"
+        return "🔴", "Alert"
 
 
 def graficar_evolucion_subciclos(features_df):
@@ -210,8 +210,8 @@ def graficar_evolucion_subciclos(features_df):
     x = range(len(datos))
     colores = {
         "Normal": "#55A868",
-        "Atención": "#DDB13A",
-        "Alerta": "#C44E52",
+        "Attention": "#DDB13A",
+        "Alert": "#C44E52",
     }
     etiquetas = [color_semaforo(p)[1] for p in datos["percentil"]]
 
@@ -228,8 +228,8 @@ def graficar_evolucion_subciclos(features_df):
     ax.axhline(UMBRAL_AMBAR, color="#C44E52", linestyle="--", linewidth=1)
     ax.set_xticks(list(x))
     ax.set_xticklabels(datos["Subcycle"], rotation=90, fontsize=7)
-    ax.set_xlabel("Subciclo (orden de ejecución)")
-    ax.set_ylabel("Percentil de anomalía")
+    ax.set_xlabel("Subcycle (execution order)")
+    ax.set_ylabel("Anomaly percentile")
     ax.set_ylim(0, 1.05)
     ax.legend(loc="upper left", fontsize=8, ncol=3)
     fig.tight_layout()
@@ -237,13 +237,13 @@ def graficar_evolucion_subciclos(features_df):
 
 
 def render_tab_anomalias():
-    st.subheader("Detección de anomalías (IPR)")
+    st.subheader("Anomaly detection (IPR)")
 
     modelo_bundle = cargar_modelo()
     engine, engine_qitdb = conexiones()
 
-    st.markdown("#### Últimos ensayos")
-    n_mostrar = st.slider("Nº de ensayos a mostrar", min_value=20, max_value=300,
+    st.markdown("#### Latest tests")
+    n_mostrar = st.slider("Number of tests to show", min_value=20, max_value=300,
                            value=100, step=20)
     ultimos = opciones_ultimos_tests(engine_qitdb, n=n_mostrar)
     seleccion = st.dataframe(
@@ -257,12 +257,12 @@ def render_tab_anomalias():
     if filas_seleccionadas:
         fila = ultimos.iloc[filas_seleccionadas[0]]
         vib, test_name = fila["VIB"], fila["TestName"]
-        st.caption(f"Ensayo seleccionado de la tabla: **{vib} / {test_name} / SNR {fila['SNR']}**")
+        st.caption(f"Test selected from the table: **{vib} / {test_name} / SNR {fila['SNR']}**")
     else:
-        st.markdown("#### O bien, filtrar manualmente")
+        st.markdown("#### Or filter manually")
         col1, col2, col3 = st.columns(3)
         with col1:
-            vib = st.selectbox("Modelo de producto (VIB)", opciones_vib(engine_qitdb))
+            vib = st.selectbox("Product model (VIB)", opciones_vib(engine_qitdb))
         with col2:
             test_name = st.selectbox("Test", opciones_test(engine_qitdb, vib) if vib else [])
         with col3:
@@ -276,12 +276,12 @@ def render_tab_anomalias():
             fila = snr_df.iloc[etiquetas_snr.index(snr_elegido)]
 
     if fila is None:
-        st.caption("Selecciona un ensayo en la tabla de arriba, o usa los filtros "
-                   "manuales. El análisis se lanza automáticamente al seleccionar; "
-                   "la consulta a la base de datos puede tardar unos segundos.")
+        st.caption("Select a test from the table above, or use the manual filters. "
+                   "The analysis runs automatically upon selection; the database "
+                   "query may take a few seconds.")
         return
 
-    with st.spinner("Consultando la base de datos y puntuando el ensayo..."):
+    with st.spinner("Querying the database and scoring the test..."):
         features_df = construir_features_test(
             engine, engine_qitdb,
             fila["SNR"], fila["FD"], vib, test_name,
@@ -289,8 +289,8 @@ def render_tab_anomalias():
         )
 
     if features_df is None or features_df.empty:
-        st.warning("No se han encontrado datos de sensores para este ensayo en el "
-                   "rango de fechas disponible.")
+        st.warning("No sensor data was found for this test in the available "
+                   "date range.")
         return
 
     scores, percentiles_subciclo, percentil_test = puntuar(features_df, modelo_bundle)
@@ -304,28 +304,29 @@ def render_tab_anomalias():
     subciclo_peor = features_df.iloc[idx_peor]["Subcycle"]
     icono, etiqueta = color_semaforo(percentil_test)
 
-    st.markdown(f"## {icono}  Resultado: **{etiqueta}**")
-    st.metric("Percentil de anomalía del ensayo", f"{percentil_test:.0%}")
-    st.caption(f"Subciclo más anómalo: **{subciclo_peor}** — umbral de alerta: percentil > "
-               f"{UMBRAL_AMBAR:.0%}; atención entre {UMBRAL_VERDE:.0%} y {UMBRAL_AMBAR:.0%}. "
-               f"(El percentil de cada subciclo individual en la tabla de abajo es "
-               f"orientativo, relativo a otros subciclos sueltos; el veredicto global "
-               f"usa la comparación correcta entre ensayos completos.)")
+    st.markdown(f"## {icono}  Result: **{etiqueta}**")
+    st.metric("Test anomaly percentile", f"{percentil_test:.0%}")
+    st.caption(f"Most anomalous subcycle: **{subciclo_peor}** — alert threshold: percentile > "
+               f"{UMBRAL_AMBAR:.0%}; attention between {UMBRAL_VERDE:.0%} and {UMBRAL_AMBAR:.0%}. "
+               f"(The percentile of each individual subcycle in the table below is "
+               f"indicative, relative to other individual subcycles; the overall verdict "
+               f"uses the proper comparison between complete tests.)")
 
-    st.markdown("### Evolución por subciclo")
+    st.markdown("### Evolution by subcycle")
     st.pyplot(graficar_evolucion_subciclos(features_df))
 
-    st.markdown("### Detalle por subciclo")
+    st.markdown("### Detail by subcycle")
     tabla = features_df[["Subcycle", "Repetition", "score_anomalia", "percentil"]].copy()
-    tabla["semáforo"] = tabla["percentil"].apply(lambda p: color_semaforo(p)[0])
+    tabla["status"] = tabla["percentil"].apply(lambda p: color_semaforo(p)[0])
     tabla = tabla.sort_values("percentil", ascending=False).reset_index(drop=True)
     tabla["percentil"] = tabla["percentil"].map(lambda p: f"{p:.0%}")
+    tabla = tabla.rename(columns={"score_anomalia": "anomaly_score", "percentil": "percentile"})
     st.dataframe(
-        tabla[["semáforo", "Subcycle", "Repetition", "score_anomalia", "percentil"]],
+        tabla[["status", "Subcycle", "Repetition", "anomaly_score", "percentile"]],
         use_container_width=True, hide_index=True,
     )
 
 
 if __name__ == "__main__":
-    st.set_page_config(page_title="Detección de anomalías", layout="wide")
+    st.set_page_config(page_title="Anomaly detection", layout="wide")
     render_tab_anomalias()
